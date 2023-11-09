@@ -1,10 +1,11 @@
+//go:build windows
+
 package main
 
 import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"strings"
@@ -12,19 +13,21 @@ import (
 	"unsafe"
 
 	"github.com/Microsoft/go-winio"
-	runhcsopts "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
-	"github.com/Microsoft/hcsshim/internal/shimdiag"
-	"github.com/Microsoft/hcsshim/pkg/octtrpc"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/runtime/v2/task"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/ttrpc"
-	"github.com/containerd/typeurl"
-	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
+	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"golang.org/x/sys/windows"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+
+	runhcsopts "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
+	"github.com/Microsoft/hcsshim/internal/extendedtask"
+	hcslog "github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/internal/shimdiag"
+	"github.com/Microsoft/hcsshim/pkg/octtrpc"
 )
 
 var svc *service
@@ -83,7 +86,7 @@ var serveCommand = cli.Command{
 		}
 
 		if shimOpts.Debug && shimOpts.LogLevel != "" {
-			logrus.Warning("Both Debug and LogLevel specified, Debug will be overriden")
+			logrus.Warning("Both Debug and LogLevel specified, Debug will be overridden")
 		}
 
 		// For now keep supporting the debug option, this used to be the only way to specify a different logging
@@ -105,7 +108,7 @@ var serveCommand = cli.Command{
 		switch shimOpts.DebugType {
 		case runhcsopts.Options_NPIPE:
 			logrus.SetFormatter(&logrus.TextFormatter{
-				TimestampFormat: log.RFC3339NanoFixed,
+				TimestampFormat: hcslog.TimeFormat,
 				FullTimestamp:   true,
 			})
 			// Setup the log listener
@@ -151,11 +154,16 @@ var serveCommand = cli.Command{
 		case runhcsopts.Options_FILE:
 			panic("file log output mode is not supported")
 		case runhcsopts.Options_ETW:
-			logrus.SetFormatter(nopFormatter{})
-			logrus.SetOutput(ioutil.Discard)
+			logrus.SetFormatter(hcslog.NopFormatter{})
+			logrus.SetOutput(io.Discard)
 		}
 
 		os.Stdin.Close()
+
+		// enable scrubbing
+		if shimOpts.ScrubLogs {
+			hcslog.SetScrubbing(true)
+		}
 
 		// Force the cli.ErrWriter to be os.Stdout for this. We use stderr for
 		// the panic.log attached via start.
@@ -167,12 +175,10 @@ var serveCommand = cli.Command{
 		}
 
 		ttrpcAddress := os.Getenv(ttrpcAddressEnv)
-		ttrpcEventPublisher, err := newEventPublisher(ttrpcAddress)
-
+		ttrpcEventPublisher, err := newEventPublisher(ttrpcAddress, namespaceFlag)
 		if err != nil {
 			return err
 		}
-
 		defer func() {
 			if err != nil {
 				ttrpcEventPublisher.close()
@@ -180,11 +186,13 @@ var serveCommand = cli.Command{
 		}()
 
 		// Setup the ttrpc server
-		svc = &service{
-			events:    ttrpcEventPublisher,
-			tid:       idFlag,
-			isSandbox: ctx.Bool("is-sandbox"),
+		svc, err = NewService(WithEventPublisher(ttrpcEventPublisher),
+			WithTID(idFlag),
+			WithIsSandbox(ctx.Bool("is-sandbox")))
+		if err != nil {
+			return fmt.Errorf("failed to create new service: %w", err)
 		}
+
 		s, err := ttrpc.NewServer(ttrpc.WithUnaryServerInterceptor(octtrpc.ServerInterceptor()))
 		if err != nil {
 			return err
@@ -192,6 +200,7 @@ var serveCommand = cli.Command{
 		defer s.Close()
 		task.RegisterTaskService(s, svc)
 		shimdiag.RegisterShimDiagService(s, svc)
+		extendedtask.RegisterExtendedTaskService(s, svc)
 
 		sl, err := winio.ListenPipe(socket, nil)
 		if err != nil {
@@ -202,10 +211,10 @@ var serveCommand = cli.Command{
 		serrs := make(chan error, 1)
 		defer close(serrs)
 		go func() {
-			// TODO: JTERRY75 We should use a real context with cancellation shared by
-			// the service for shim shutdown gracefully.
-			ctx := context.Background()
-			if err := trapClosedConnErr(s.Serve(ctx, sl)); err != nil {
+			// Serve loops infinitely unless s.Shutdown or s.Close are called.
+			// Passed in context is used as parent context for handling requests,
+			// but canceliing does not bring down ttrpc service.
+			if err := trapClosedConnErr(s.Serve(context.Background(), sl)); err != nil {
 				logrus.WithError(err).Fatal("containerd-shim: ttrpc server failure")
 				serrs <- err
 				return
@@ -219,8 +228,7 @@ var serveCommand = cli.Command{
 		case err := <-serrs:
 			return err
 		case <-time.After(2 * time.Millisecond):
-			// TODO: JTERRY75 this is terrible code. Contribue a change to
-			// ttrpc that you can:
+			// TODO: Contribute a change to ttrpc so that you can:
 			//
 			// go func () { errs <- s.Serve() }
 			// select {
@@ -230,12 +238,27 @@ var serveCommand = cli.Command{
 
 			// This is our best indication that we have not errored on creation
 			// and are successfully serving the API.
+			// Closing stdout signals to containerd that shim started successfully
 			os.Stdout.Close()
 		}
 
 		// Wait for the serve API to be shut down.
-		<-serrs
-		return nil
+		select {
+		case err = <-serrs:
+			// the ttrpc server shutdown without processing a shutdown request
+		case <-svc.Done():
+			if !svc.gracefulShutdown {
+				// Return immediately, but still close ttrpc server, pipes, and spans
+				// Shouldn't need to os.Exit without clean up (ie, deferred `.Close()`s)
+				return nil
+			}
+			// currently the ttrpc shutdown is the only clean up to wait on
+			sctx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
+			defer cancel()
+			err = s.Shutdown(sctx)
+		}
+
+		return err
 	},
 }
 
@@ -249,18 +272,18 @@ func trapClosedConnErr(err error) error {
 // readOptions reads in bytes from the reader and converts it to a shim options
 // struct. If no data is available from the reader, returns (nil, nil).
 func readOptions(r io.Reader) (*runhcsopts.Options, error) {
-	d, err := ioutil.ReadAll(r)
+	d, err := io.ReadAll(r)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read input")
 	}
 	if len(d) > 0 {
-		var a types.Any
+		var a anypb.Any
 		if err := proto.Unmarshal(d, &a); err != nil {
-			return nil, errors.Wrap(err, "failed unmarshaling into Any")
+			return nil, errors.Wrap(err, "failed unmarshalling into Any")
 		}
 		v, err := typeurl.UnmarshalAny(&a)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed unmarshaling by typeurl")
+			return nil, errors.Wrap(err, "failed unmarshalling by typeurl")
 		}
 		return v.(*runhcsopts.Options), nil
 	}

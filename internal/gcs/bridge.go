@@ -1,3 +1,5 @@
+//go:build windows
+
 package gcs
 
 import (
@@ -10,13 +12,13 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
+
+	"github.com/Microsoft/hcsshim/internal/log"
 )
 
 const (
@@ -67,9 +69,7 @@ type bridge struct {
 	waitCh  chan struct{}
 }
 
-var (
-	errBridgeClosed = errors.New("bridge closed")
-)
+var errBridgeClosed = fmt.Errorf("bridge closed: %w", net.ErrClosed)
 
 const (
 	// bridgeFailureTimeout is the default value for bridge.Timeout
@@ -182,13 +182,8 @@ func (err *rpcError) Error() string {
 	return "guest RPC failure: " + msg
 }
 
-// IsNotExist is a helper function to determine if the inner rpc error is Not Exist
-func IsNotExist(err error) bool {
-	switch rerr := err.(type) {
-	case *rpcError:
-		return uint32(rerr.result) == hrComputeSystemDoesNotExist
-	}
-	return false
+func (err *rpcError) Unwrap() error {
+	return windows.Errno(err.result)
 }
 
 // Err returns the RPC's result. This may be a transport error or an error from
@@ -287,12 +282,7 @@ func readMessage(r io.Reader) (int64, msgType, []byte, error) {
 }
 
 func isLocalDisconnectError(err error) bool {
-	if o, ok := err.(*net.OpError); ok {
-		if s, ok := o.Err.(*os.SyscallError); ok {
-			return s.Err == syscall.WSAECONNABORTED
-		}
-	}
-	return false
+	return errors.Is(err, windows.WSAECONNABORTED)
 }
 
 func (brdg *bridge) recvLoop() error {
@@ -307,7 +297,7 @@ func (brdg *bridge) recvLoop() error {
 		}
 		brdg.log.WithFields(logrus.Fields{
 			"payload":    string(b),
-			"type":       typ,
+			"type":       typ.String(),
 			"message-id": id}).Debug("bridge receive")
 		switch typ & msgTypeMask {
 		case msgTypeResponse:
@@ -365,6 +355,7 @@ func (brdg *bridge) recvLoop() error {
 func (brdg *bridge) sendLoop() {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
 	for {
 		select {
 		case <-brdg.waitCh:
@@ -392,11 +383,26 @@ func (brdg *bridge) writeMessage(buf *bytes.Buffer, enc *json.Encoder, typ msgTy
 	}
 	// Update the message header with the size.
 	binary.LittleEndian.PutUint32(buf.Bytes()[hdrOffSize:], uint32(buf.Len()))
+
+	if brdg.log.Logger.GetLevel() >= logrus.DebugLevel {
+		b := buf.Bytes()[hdrSize:]
+		switch typ {
+		// container environment vars are in rpCreate for linux; rpcExecuteProcess for windows
+		case msgType(rpcCreate) | msgTypeRequest:
+			b, err = log.ScrubBridgeCreate(b)
+		case msgType(rpcExecuteProcess) | msgTypeRequest:
+			b, err = log.ScrubBridgeExecProcess(b)
+		}
+		if err != nil {
+			brdg.log.WithError(err).Warning("could not scrub bridge payload")
+		}
+		brdg.log.WithFields(logrus.Fields{
+			"payload":    string(b),
+			"type":       typ.String(),
+			"message-id": id}).Debug("bridge send")
+	}
+
 	// Write the message.
-	brdg.log.WithFields(logrus.Fields{
-		"payload":    string(buf.Bytes()[hdrSize:]),
-		"type":       typ,
-		"message-id": id}).Debug("bridge send")
 	_, err = buf.WriteTo(brdg.conn)
 	if err != nil {
 		return fmt.Errorf("bridge write: %s", err)

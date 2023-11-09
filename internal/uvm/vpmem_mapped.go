@@ -1,3 +1,5 @@
+//go:build windows
+
 package uvm
 
 import (
@@ -8,12 +10,12 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
-	"github.com/Microsoft/hcsshim/internal/guestrequest"
 	"github.com/Microsoft/hcsshim/internal/hcs/resourcepaths"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/memory"
-	"github.com/Microsoft/hcsshim/internal/requesttype"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 )
 
 const (
@@ -66,30 +68,26 @@ func pageAlign(t uint64) uint64 {
 
 // newMappedVPMemModifyRequest creates an hcsschema.ModifySettingsRequest to modify VPMem devices/mappings
 // for the multi-mapping setup
-func newMappedVPMemModifyRequest(ctx context.Context, rType string, deviceNumber uint32, md *mappedDeviceInfo, uvm *UtilityVM) (*hcsschema.ModifySettingRequest, error) {
-	guestSettings := guestrequest.LCOWMappedVPMemDevice{
+func newMappedVPMemModifyRequest(
+	ctx context.Context,
+	rType guestrequest.RequestType,
+	deviceNumber uint32,
+	md *mappedDeviceInfo,
+	uvm *UtilityVM,
+) (*hcsschema.ModifySettingRequest, error) {
+	guestSettings := guestresource.LCOWMappedVPMemDevice{
 		DeviceNumber: deviceNumber,
 		MountPath:    md.uvmPath,
-		MappingInfo: &guestrequest.LCOWMappedLayer{
+		MappingInfo: &guestresource.LCOWVPMemMappingInfo{
 			DeviceOffsetInBytes: md.mappedRegion.Offset(),
 			DeviceSizeInBytes:   md.sizeInBytes,
 		},
 	}
 
-	if verity, err := readVeritySuperBlock(ctx, md.hostPath); err != nil {
-		log.G(ctx).WithError(err).WithField("hostPath", md.hostPath).Debug("unable to read dm-verity information from VHD")
-	} else {
-		log.G(ctx).WithFields(logrus.Fields{
-			"hostPath":   md.hostPath,
-			"rootDigest": verity.RootDigest,
-		}).Debug("adding multi-mapped VPMem with dm-verity")
-		guestSettings.VerityInfo = verity
-	}
-
 	request := &hcsschema.ModifySettingRequest{
 		RequestType: rType,
-		GuestRequest: guestrequest.GuestRequest{
-			ResourceType: guestrequest.ResourceTypeVPMemDevice,
+		GuestRequest: guestrequest.ModificationRequest{
+			ResourceType: guestresource.ResourceTypeVPMemDevice,
 			RequestType:  rType,
 			Settings:     guestSettings,
 		},
@@ -97,7 +95,7 @@ func newMappedVPMemModifyRequest(ctx context.Context, rType string, deviceNumber
 
 	pmem := uvm.vpmemDevicesMultiMapped[deviceNumber]
 	switch rType {
-	case requesttype.Add:
+	case guestrequest.RequestTypeAdd:
 		if pmem == nil {
 			request.Settings = hcsschema.VirtualPMemDevice{
 				ReadOnly:    true,
@@ -112,15 +110,11 @@ func newMappedVPMemModifyRequest(ctx context.Context, rType string, deviceNumber
 			}
 			request.ResourcePath = fmt.Sprintf(resourcepaths.VPMemDeviceResourceFormat, deviceNumber, md.mappedRegion.Offset())
 		}
-	case requesttype.Remove:
+	case guestrequest.RequestTypeRemove:
 		if pmem == nil {
 			return nil, errors.Errorf("no device found at location %d", deviceNumber)
 		}
-		if len(pmem.mappings) == 1 {
-			request.ResourcePath = fmt.Sprintf(resourcepaths.VPMemControllerResourceFormat, deviceNumber)
-		} else {
-			request.ResourcePath = fmt.Sprintf(resourcepaths.VPMemDeviceResourceFormat, deviceNumber, md.mappedRegion.Offset())
-		}
+		request.ResourcePath = fmt.Sprintf(resourcepaths.VPMemDeviceResourceFormat, deviceNumber, md.mappedRegion.Offset())
 	default:
 		return nil, errors.New("unsupported request type")
 	}
@@ -259,13 +253,13 @@ func (uvm *UtilityVM) addVPMemMappedDevice(ctx context.Context, hostPath string)
 
 	uvmPath := fmt.Sprintf(lcowPackedVPMemLayerFmt, deviceNumber, memReg.Offset(), devSize)
 	md := newVPMemMappedDevice(hostPath, uvmPath, devSize, memReg)
-	modification, err := newMappedVPMemModifyRequest(ctx, requesttype.Add, deviceNumber, md, uvm)
+	modification, err := newMappedVPMemModifyRequest(ctx, guestrequest.RequestTypeAdd, deviceNumber, md, uvm)
 	if err := uvm.modify(ctx, modification); err != nil {
 		return "", errors.Errorf("uvm::addVPMemMappedDevice: failed to modify utility VM configuration: %s", err)
 	}
 	defer func() {
 		if err != nil {
-			rmRequest, _ := newMappedVPMemModifyRequest(ctx, requesttype.Remove, deviceNumber, md, uvm)
+			rmRequest, _ := newMappedVPMemModifyRequest(ctx, guestrequest.RequestTypeRemove, deviceNumber, md, uvm)
 			if err := uvm.modify(ctx, rmRequest); err != nil {
 				log.G(ctx).WithError(err).Debugf("failed to rollback modification")
 			}
@@ -279,8 +273,18 @@ func (uvm *UtilityVM) addVPMemMappedDevice(ctx context.Context, hostPath string)
 	return uvmPath, nil
 }
 
-// removeVPMemMappedDevice removes a mapped container layer, if the layer is the last to be removed, removes
-// VPMem device instead
+// removeVPMemMappedDevice removes a mapped container layer. The VPMem device itself
+// is never removed after being added.
+//
+// The bug occurs when we try to clean up a mapped VHD at non-zero offset.
+// What happens is, the device-mapper target that corresponds to the mapped
+// layer VHD is unmounted and removed inside the guest, however removal on
+// the host through HCS API fails with "not found", because HCS API doesn't
+// allow removal of a VPMem if it doesn't have a mapped device at offset 0, this
+// results in the reference not being decreased and hcsshim "thinking" that the
+// layer is still present. Next time this layer is used by a different
+// container, it appears as if the layer is still mounted inside the guest as
+// well, which results in overlayfs mount failures.
 //
 // Lock MUST be held when calling this function
 func (uvm *UtilityVM) removeVPMemMappedDevice(ctx context.Context, hostPath string) error {
@@ -293,7 +297,7 @@ func (uvm *UtilityVM) removeVPMemMappedDevice(ctx context.Context, hostPath stri
 		return nil
 	}
 
-	modification, err := newMappedVPMemModifyRequest(ctx, requesttype.Remove, devNum, md, uvm)
+	modification, err := newMappedVPMemModifyRequest(ctx, guestrequest.RequestTypeRemove, devNum, md, uvm)
 	if err != nil {
 		return err
 	}

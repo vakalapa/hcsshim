@@ -1,28 +1,31 @@
-// +build functional
+//go:build windows && functional
+// +build windows,functional
 
 package cri_containerd
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/Microsoft/go-winio"
+	"github.com/Microsoft/hcsshim/internal/memory"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
-	testutilities "github.com/Microsoft/hcsshim/test/functional/utilities"
+	"github.com/Microsoft/hcsshim/test/pkg/require"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 func runCreateContainerTest(t *testing.T, runtimeHandler string, request *runtime.CreateContainerRequest) {
+	t.Helper()
 	sandboxRequest := getRunPodSandboxRequest(t, runtimeHandler)
 	runCreateContainerTestWithSandbox(t, sandboxRequest, request)
 }
 
 func runCreateContainerTestWithSandbox(t *testing.T, sandboxRequest *runtime.RunPodSandboxRequest, request *runtime.CreateContainerRequest) {
+	t.Helper()
 	client := newTestRuntimeClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -275,7 +278,7 @@ func Test_CreateContainer_MemorySize_Config_WCOW_Process(t *testing.T) {
 			},
 			Windows: &runtime.WindowsContainerConfig{
 				Resources: &runtime.WindowsContainerResources{
-					MemoryLimitInBytes: 768 * 1024 * 1024, // 768MB
+					MemoryLimitInBytes: 768 * memory.MiB, // 768MB
 				},
 			},
 		},
@@ -335,7 +338,7 @@ func Test_CreateContainer_MemorySize_Config_WCOW_Hypervisor(t *testing.T) {
 			},
 			Windows: &runtime.WindowsContainerConfig{
 				Resources: &runtime.WindowsContainerResources{
-					MemoryLimitInBytes: 768 * 1024 * 1024, // 768MB
+					MemoryLimitInBytes: 768 * memory.MiB, // 768MB
 				},
 			},
 		},
@@ -391,7 +394,7 @@ func Test_CreateContainer_MemorySize_LCOW(t *testing.T) {
 			},
 			Linux: &runtime.LinuxContainerConfig{
 				Resources: &runtime.LinuxContainerResources{
-					MemoryLimitInBytes: 768 * 1024 * 1024, // 768MB
+					MemoryLimitInBytes: 768 * memory.MiB, // 768MB
 				},
 			},
 		},
@@ -843,11 +846,11 @@ func Test_CreateContainer_CPUShares_LCOW(t *testing.T) {
 
 func Test_CreateContainer_Mount_File_LCOW(t *testing.T) {
 	requireFeatures(t, featureLCOW)
-	testutilities.RequiresBuild(t, osversion.V19H1)
+	require.Build(t, osversion.V19H1)
 
 	pullRequiredLCOWImages(t, []string{imageLcowK8sPause, imageLcowAlpine})
 
-	tempFile, err := ioutil.TempFile("", "test")
+	tempFile, err := os.CreateTemp("", "test")
 
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %s", err)
@@ -888,11 +891,11 @@ func Test_CreateContainer_Mount_File_LCOW(t *testing.T) {
 
 func Test_CreateContainer_Mount_ReadOnlyFile_LCOW(t *testing.T) {
 	requireFeatures(t, featureLCOW)
-	testutilities.RequiresBuild(t, osversion.V19H1)
+	require.Build(t, osversion.V19H1)
 
 	pullRequiredLCOWImages(t, []string{imageLcowK8sPause, imageLcowAlpine})
 
-	tempFile, err := ioutil.TempFile("", "test")
+	tempFile, err := os.CreateTemp("", "test")
 
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %s", err)
@@ -937,11 +940,7 @@ func Test_CreateContainer_Mount_Dir_LCOW(t *testing.T) {
 
 	pullRequiredLCOWImages(t, []string{imageLcowK8sPause, imageLcowAlpine})
 
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	containerFilePath := "/foo"
 
@@ -973,11 +972,7 @@ func Test_CreateContainer_Mount_ReadOnlyDir_LCOW(t *testing.T) {
 
 	pullRequiredLCOWImages(t, []string{imageLcowK8sPause, imageLcowAlpine})
 
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	containerFilePath := "/foo"
 
@@ -1009,7 +1004,7 @@ func Test_CreateContainer_Mount_File_WCOW(t *testing.T) {
 	requireFeatures(t, featureWCOWHypervisor)
 	pullRequiredImages(t, []string{imageWindowsNanoserver})
 
-	tempFile, err := ioutil.TempFile("", "test")
+	tempFile, err := os.CreateTemp("", "test")
 
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %s", err)
@@ -1054,7 +1049,7 @@ func Test_CreateContainer_Mount_ReadOnlyFile_WCOW(t *testing.T) {
 
 	pullRequiredImages(t, []string{imageWindowsNanoserver})
 
-	tempFile, err := ioutil.TempFile("", "test")
+	tempFile, err := os.CreateTemp("", "test")
 
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %s", err)
@@ -1100,11 +1095,7 @@ func Test_CreateContainer_Mount_Dir_WCOW(t *testing.T) {
 
 	pullRequiredImages(t, []string{imageWindowsNanoserver})
 
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	containerFilePath := "C:\\foo"
 
@@ -1137,11 +1128,7 @@ func Test_CreateContainer_Mount_ReadOnlyDir_WCOW(t *testing.T) {
 
 	pullRequiredImages(t, []string{imageWindowsNanoserver})
 
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	containerFilePath := "C:\\foo"
 
@@ -1175,11 +1162,7 @@ func Test_CreateContainer_Mount_EmptyDir_WCOW(t *testing.T) {
 
 	pullRequiredImages(t, []string{imageWindowsNanoserver})
 
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 	path := filepath.Join(tempDir, "kubernetes.io~empty-dir", "volume1")
 	if err := os.MkdirAll(path, 0); err != nil {
 		t.Fatalf("Failed to create kubernetes.io~empty-dir volume path: %s", err)
@@ -1222,11 +1205,7 @@ func Test_Mount_ReadOnlyDirReuse_WCOW(t *testing.T) {
 
 	containerPath := `C:\foo`
 
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	sandboxRequest := getRunPodSandboxRequest(t, wcowHypervisorRuntimeHandler)
 
@@ -1258,29 +1237,29 @@ func Test_Mount_ReadOnlyDirReuse_WCOW(t *testing.T) {
 
 	request.Config.Metadata.Name = request.Config.Metadata.Name + "-ro"
 	request.Config.Mounts[0].Readonly = true
-	c_ro := createContainer(t, client, ctx, request)
-	defer removeContainer(t, client, ctx, c_ro)
-	startContainer(t, client, ctx, c_ro)
-	defer stopContainer(t, client, ctx, c_ro)
+	cRO := createContainer(t, client, ctx, request)
+	defer removeContainer(t, client, ctx, cRO)
+	startContainer(t, client, ctx, cRO)
+	defer stopContainer(t, client, ctx, cRO)
 
 	request.Config.Metadata.Name = request.Config.Metadata.Name + "-rw"
 	request.Config.Mounts[0].Readonly = false
-	c_rw := createContainer(t, client, ctx, request)
-	defer removeContainer(t, client, ctx, c_rw)
-	startContainer(t, client, ctx, c_rw)
-	defer stopContainer(t, client, ctx, c_rw)
+	cRW := createContainer(t, client, ctx, request)
+	defer removeContainer(t, client, ctx, cRW)
+	startContainer(t, client, ctx, cRW)
+	defer stopContainer(t, client, ctx, cRW)
 
 	filePath := containerPath + `\tmp.txt`
 	execCommand := []string{"cmd", "/c", "echo foo", ">", filePath}
 
-	_, errorMsg, exitCode := execContainer(t, client, ctx, c_rw, execCommand)
+	_, errorMsg, exitCode := execContainer(t, client, ctx, cRW, execCommand)
 
 	// Writing a file to the rw container mount should succeed.
 	if exitCode != 0 || len(errorMsg) > 0 {
 		t.Fatalf("Failed to write file to rw container mount: %s, exitcode: %v\n", errorMsg, exitCode)
 	}
 
-	_, errorMsg, exitCode = execContainer(t, client, ctx, c_ro, execCommand)
+	_, errorMsg, exitCode = execContainer(t, client, ctx, cRO, execCommand)
 
 	// Writing a file to the ro container mount should fail.
 	if exitCode == 0 && len(errorMsg) == 0 {

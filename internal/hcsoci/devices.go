@@ -1,13 +1,17 @@
+//go:build windows
+
 package hcsoci
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
+
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/pkg/errors"
 
 	"github.com/Microsoft/hcsshim/internal/devices"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
@@ -17,8 +21,6 @@ import (
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 )
 
 const deviceUtilExeName = "device-util.exe"
@@ -47,28 +49,14 @@ func getDeviceExtensionPaths(annots map[string]string) ([]string, error) {
 	return extensions, nil
 }
 
-// getGPUVHDPath gets the gpu vhd path from the shim options or uses the default if no
-// shim option is set. Right now we only support Nvidia gpus, so this will default to
-// a gpu vhd with nvidia files
-func getGPUVHDPath(annot map[string]string) (string, error) {
-	gpuVHDPath, ok := annot[annotations.GPUVHDPath]
-	if !ok || gpuVHDPath == "" {
-		return "", errors.New("no gpu vhd specified")
-	}
-	if _, err := os.Stat(gpuVHDPath); err != nil {
-		return "", errors.Wrapf(err, "failed to find gpu support vhd %s", gpuVHDPath)
-	}
-	return gpuVHDPath, nil
-}
-
 // getDeviceUtilHostPath is a simple helper function to find the host path of the device-util tool
 func getDeviceUtilHostPath() string {
 	return filepath.Join(filepath.Dir(os.Args[0]), deviceUtilExeName)
 }
 
 func isDeviceExtensionsSupported() bool {
-	// device extensions support was added from 20348 onwards.
-	return osversion.Build() >= 20348
+	// device extensions support was added from LTSC2022 (20348) onwards.
+	return osversion.Build() >= osversion.LTSC2022
 }
 
 // getDeviceExtensions is a helper function to read the files at `extensionPaths` and unmarshal the contents
@@ -91,7 +79,7 @@ func getDeviceExtensions(annotations map[string]string) (*hcsschema.ContainerDef
 		DeviceExtension: []hcsschema.DeviceExtension{},
 	}
 	for _, extensionPath := range extensionPaths {
-		data, err := ioutil.ReadFile(extensionPath)
+		data, err := os.ReadFile(extensionPath)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to read extension file at %s", extensionPath)
 		}
@@ -115,7 +103,6 @@ func handleAssignedDevicesWindows(
 	vm *uvm.UtilityVM,
 	annotations map[string]string,
 	specDevs []specs.WindowsDevice) (resultDevs []specs.WindowsDevice, closers []resources.ResourceCloser, err error) {
-
 	defer func() {
 		if err != nil {
 			// best effort clean up allocated resources on failure
@@ -173,7 +160,6 @@ func handleAssignedDevicesLCOW(
 	vm *uvm.UtilityVM,
 	annotations map[string]string,
 	specDevs []specs.WindowsDevice) (resultDevs []specs.WindowsDevice, closers []resources.ResourceCloser, err error) {
-
 	defer func() {
 		if err != nil {
 			// best effort clean up allocated resources on failure
@@ -187,15 +173,12 @@ func handleAssignedDevicesLCOW(
 		}
 	}()
 
-	gpuPresent := false
-
 	// assign device into UVM and create corresponding spec windows devices
 	for _, d := range specDevs {
 		switch d.IDType {
 		case uvm.VPCIDeviceIDType, uvm.VPCIDeviceIDTypeLegacy, uvm.GPUDeviceIDType:
-			gpuPresent = gpuPresent || d.IDType == uvm.GPUDeviceIDType
 			pciID, index := getDeviceInfoFromPath(d.ID)
-			vpci, err := vm.AssignDevice(ctx, pciID, index)
+			vpci, err := vm.AssignDevice(ctx, pciID, index, "")
 			if err != nil {
 				return resultDevs, closers, errors.Wrapf(err, "failed to assign device %s, function %d to pod %s", pciID, index, vm.ID())
 			}
@@ -210,34 +193,11 @@ func handleAssignedDevicesLCOW(
 		}
 	}
 
-	if gpuPresent {
-		gpuSupportVhdPath, err := getGPUVHDPath(annotations)
-		if err != nil {
-			return resultDevs, closers, errors.Wrapf(err, "failed to add gpu vhd to %v", vm.ID())
-		}
-		// use lcowNvidiaMountPath since we only support nvidia gpus right now
-		// must use scsi here since DDA'ing a hyper-v pci device is not supported on VMs that have ANY virtual memory
-		// gpuvhd must be granted VM Group access.
-		options := []string{"ro"}
-		scsiMount, err := vm.AddSCSI(
-			ctx,
-			gpuSupportVhdPath,
-			uvm.LCOWNvidiaMountPath,
-			true,
-			false,
-			options,
-			uvm.VMAccessTypeNoop,
-		)
-		if err != nil {
-			return resultDevs, closers, errors.Wrapf(err, "failed to add scsi device %s in the UVM %s at %s", gpuSupportVhdPath, vm.ID(), uvm.LCOWNvidiaMountPath)
-		}
-		closers = append(closers, scsiMount)
-	}
-
 	return resultDevs, closers, nil
 }
 
-func installPodDrivers(ctx context.Context, vm *uvm.UtilityVM, annotations map[string]string) (closers []resources.ResourceCloser, err error) {
+// addSpecGuestDrivers is a helper function to install kernel drivers specified on a spec into the guest
+func addSpecGuestDrivers(ctx context.Context, vm *uvm.UtilityVM, annotations map[string]string) (closers []resources.ResourceCloser, err error) {
 	defer func() {
 		if err != nil {
 			// best effort clean up allocated resources on failure
@@ -255,11 +215,13 @@ func installPodDrivers(ctx context.Context, vm *uvm.UtilityVM, annotations map[s
 		return closers, err
 	}
 	for _, d := range drivers {
-		driverCloser, err := devices.InstallKernelDriver(ctx, vm, d)
+		driverCloser, err := devices.InstallDrivers(ctx, vm, d)
 		if err != nil {
 			return closers, err
 		}
-		closers = append(closers, driverCloser)
+		if driverCloser != nil {
+			closers = append(closers, driverCloser)
+		}
 	}
 	return closers, err
 }

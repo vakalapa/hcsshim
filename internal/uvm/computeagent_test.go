@@ -1,15 +1,19 @@
+//go:build windows
+
 package uvm
 
 import (
 	"context"
 	"testing"
 
+	"github.com/containerd/containerd/protobuf"
+	typeurl "github.com/containerd/typeurl/v2"
+
 	"github.com/Microsoft/hcsshim/hcn"
 	"github.com/Microsoft/hcsshim/internal/computeagent"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/hns"
-	"github.com/containerd/typeurl"
-	"github.com/gogo/protobuf/types"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 )
 
 type testUtilityVM struct{}
@@ -28,11 +32,19 @@ func (t *testUtilityVM) UpdateNIC(ctx context.Context, id string, settings *hcss
 	return nil
 }
 
-func (t *testUtilityVM) AssignDevice(ctx context.Context, deviceID string, index uint16) (*VPCIDevice, error) {
+func (t *testUtilityVM) AssignDevice(ctx context.Context, deviceID string, index uint16, vmBusGUID string) (*VPCIDevice, error) {
 	return &VPCIDevice{}, nil
 }
 
 func (t *testUtilityVM) RemoveDevice(ctx context.Context, deviceID string, index uint16) error {
+	return nil
+}
+
+func (t *testUtilityVM) AddNICInGuest(ctx context.Context, cfg *guestresource.LCOWNetworkAdapter) error {
+	return nil
+}
+
+func (t *testUtilityVM) RemoveNICInGuest(ctx context.Context, cfg *guestresource.LCOWNetworkAdapter) error {
 	return nil
 }
 
@@ -84,7 +96,7 @@ func TestAddNIC(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(_ *testing.T) {
 			var err error
-			var anyEndpoint *types.Any
+			var anyEndpoint typeurl.Any
 			if test.endpointName != "" {
 				endpoint := &hcn.HostComputeEndpoint{
 					Name: test.endpointName,
@@ -96,7 +108,7 @@ func TestAddNIC(t *testing.T) {
 			}
 			req := &computeagent.AddNICInternalRequest{
 				NicID:    test.nicID,
-				Endpoint: anyEndpoint,
+				Endpoint: protobuf.FromAny(anyEndpoint),
 			}
 
 			_, err = agent.AddNIC(ctx, req)
@@ -173,7 +185,7 @@ func TestModifyNIC(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(_ *testing.T) {
 			var err error
-			var anyEndpoint *types.Any
+			var anyEndpoint typeurl.Any
 			if test.endpointName != "" {
 				endpoint := &hcn.HostComputeEndpoint{
 					Name: test.endpointName,
@@ -185,7 +197,7 @@ func TestModifyNIC(t *testing.T) {
 			}
 			req := &computeagent.ModifyNICInternalRequest{
 				NicID:             test.nicID,
-				Endpoint:          anyEndpoint,
+				Endpoint:          protobuf.FromAny(anyEndpoint),
 				IovPolicySettings: test.iovSettings,
 			}
 
@@ -247,7 +259,7 @@ func TestDeleteNIC(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(_ *testing.T) {
 			var err error
-			var anyEndpoint *types.Any
+			var anyEndpoint typeurl.Any
 			if test.endpointName != "" {
 				endpoint := &hcn.HostComputeEndpoint{
 					Name: test.endpointName,
@@ -259,7 +271,7 @@ func TestDeleteNIC(t *testing.T) {
 			}
 			req := &computeagent.DeleteNICInternalRequest{
 				NicID:    test.nicID,
-				Endpoint: anyEndpoint,
+				Endpoint: protobuf.FromAny(anyEndpoint),
 			}
 
 			_, err = agent.DeleteNIC(ctx, req)

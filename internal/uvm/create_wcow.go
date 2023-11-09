@@ -1,3 +1,5 @@
+//go:build windows
+
 package uvm
 
 import (
@@ -8,19 +10,23 @@ import (
 
 	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/pkg/guid"
+	"github.com/pkg/errors"
+	"go.opencensus.io/trace"
+
 	"github.com/Microsoft/hcsshim/internal/gcs"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/logfields"
 	"github.com/Microsoft/hcsshim/internal/oc"
 	"github.com/Microsoft/hcsshim/internal/processorinfo"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
 	"github.com/Microsoft/hcsshim/internal/schemaversion"
+	"github.com/Microsoft/hcsshim/internal/security"
+	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
 	"github.com/Microsoft/hcsshim/internal/uvmfolder"
 	"github.com/Microsoft/hcsshim/internal/wclayer"
 	"github.com/Microsoft/hcsshim/internal/wcow"
 	"github.com/Microsoft/hcsshim/osversion"
-	"github.com/pkg/errors"
-	"go.opencensus.io/trace"
 )
 
 // OptionsWCOW are the set of options passed to CreateWCOW() to create a utility vm.
@@ -28,22 +34,6 @@ type OptionsWCOW struct {
 	*Options
 
 	LayerFolders []string // Set of folders for base layers and scratch. Ordered from top most read-only through base read-only layer, followed by scratch
-
-	// IsTemplate specifies if this UVM will be saved as a template in future. Setting
-	// this option will also enable some VSMB Options during UVM creation that allow
-	// template creation.
-	IsTemplate bool
-
-	// IsClone specifies if this UVM should be created by cloning a template. If
-	// IsClone is true then a valid UVMTemplateConfig struct must be passed in the
-	// `TemplateConfig` field.
-	IsClone bool
-
-	// TemplateConfig is only used during clone creation. If a uvm is
-	// being cloned then this TemplateConfig struct must be passed
-	// which holds all the information about the template from
-	// which this clone should be created.
-	TemplateConfig *UVMTemplateConfig
 
 	// NoDirectMap specifies that no direct mapping should be used for any VSMBs added to the UVM
 	NoDirectMap bool
@@ -85,7 +75,7 @@ func prepareConfigDoc(ctx context.Context, uvm *UtilityVM, opts *OptionsWCOW, uv
 		return nil, fmt.Errorf("failed to get host processor information: %s", err)
 	}
 
-	// To maintain compatability with Docker we need to automatically downgrade
+	// To maintain compatibility with Docker we need to automatically downgrade
 	// a user CPU count if the setting is not possible.
 	uvm.processorCount = uvm.normalizeProcessorCount(ctx, opts.ProcessorCount, processorTopology)
 
@@ -218,18 +208,32 @@ func prepareConfigDoc(ctx context.Context, uvm *UtilityVM, opts *OptionsWCOW, uv
 		}
 	}
 
+	// Set boot options
+	if opts.DumpDirectoryPath != "" {
+		if info, err := os.Stat(opts.DumpDirectoryPath); err != nil {
+			return nil, fmt.Errorf("failed to stat dump directory %s: %w", opts.DumpDirectoryPath, err)
+		} else if !info.IsDir() {
+			return nil, fmt.Errorf("dump directory path %s isn't a directory", opts.DumpDirectoryPath)
+		}
+		if err := security.GrantVmGroupAccessWithMask(opts.DumpDirectoryPath, security.AccessMaskAll); err != nil {
+			return nil, fmt.Errorf("failed to add SDL to dump directory: %w", err)
+		}
+		debugOpts := &hcsschema.DebugOptions{
+			BugcheckSavedStateFileName:            filepath.Join(opts.DumpDirectoryPath, fmt.Sprintf("%s-savedstate.vmrs", uvm.id)),
+			BugcheckNoCrashdumpSavedStateFileName: filepath.Join(opts.DumpDirectoryPath, fmt.Sprintf("%s-savedstate_nocrashdump.vmrs", uvm.id)),
+		}
+		doc.VirtualMachine.DebugOptions = debugOpts
+	}
+
 	return doc, nil
 }
 
 // CreateWCOW creates an HCS compute system representing a utility VM.
-// The HCS Compute system can either be created from scratch or can be cloned from a
-// template.
 //
 // WCOW Notes:
 //   - The scratch is always attached to SCSI 0:0
-//
 func CreateWCOW(ctx context.Context, opts *OptionsWCOW) (_ *UtilityVM, err error) {
-	ctx, span := trace.StartSpan(ctx, "uvm::CreateWCOW")
+	ctx, span := oc.StartSpan(ctx, "uvm::CreateWCOW")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
@@ -248,7 +252,7 @@ func CreateWCOW(ctx context.Context, opts *OptionsWCOW) (_ *UtilityVM, err error
 		id:                      opts.ID,
 		owner:                   opts.Owner,
 		operatingSystem:         "windows",
-		scsiControllerCount:     1,
+		scsiControllerCount:     opts.SCSIControllerCount,
 		vsmbDirShares:           make(map[string]*VSMBShare),
 		vsmbFileShares:          make(map[string]*VSMBShare),
 		vpciDevices:             make(map[VPCIDeviceKey]*VPCIDevice),
@@ -256,6 +260,7 @@ func CreateWCOW(ctx context.Context, opts *OptionsWCOW) (_ *UtilityVM, err error
 		physicallyBacked:        !opts.AllowOvercommit,
 		devicesPhysicallyBacked: opts.FullyPhysicallyBacked,
 		vsmbNoDirectMap:         opts.NoDirectMap,
+		noWritableFileShares:    opts.NoWritableFileShares,
 		createOpts:              *opts,
 	}
 
@@ -275,10 +280,10 @@ func CreateWCOW(ctx context.Context, opts *OptionsWCOW) (_ *UtilityVM, err error
 	}
 
 	// TODO: BUGBUG Remove this. @jhowardmsft
-	//       It should be the responsiblity of the caller to do the creation and population.
+	//       It should be the responsibility of the caller to do the creation and population.
 	//       - Update runhcs too (vm.go).
 	//       - Remove comment in function header
-	//       - Update tests that rely on this current behaviour.
+	//       - Update tests that rely on this current behavior.
 	// Create the RW scratch in the top-most layer folder, creating the folder if it doesn't already exist.
 	scratchFolder := opts.LayerFolders[len(opts.LayerFolders)-1]
 
@@ -294,74 +299,33 @@ func CreateWCOW(ctx context.Context, opts *OptionsWCOW) (_ *UtilityVM, err error
 		return nil, fmt.Errorf("error in preparing config doc: %s", err)
 	}
 
-	if !opts.IsClone {
-		// Create sandbox.vhdx in the scratch folder based on the template, granting the correct permissions to it
-		scratchPath := filepath.Join(scratchFolder, "sandbox.vhdx")
-		if _, err := os.Stat(scratchPath); os.IsNotExist(err) {
-			if err := wcow.CreateUVMScratch(ctx, uvmFolder, scratchFolder, uvm.id); err != nil {
-				return nil, fmt.Errorf("failed to create scratch: %s", err)
-			}
-		} else {
-			// Sandbox.vhdx exists, just need to grant vm access to it.
-			if err := wclayer.GrantVmAccess(ctx, uvm.id, scratchPath); err != nil {
-				return nil, errors.Wrap(err, "failed to grant vm access to scratch")
-			}
+	// Create sandbox.vhdx in the scratch folder based on the template, granting the correct permissions to it
+	scratchPath := filepath.Join(scratchFolder, "sandbox.vhdx")
+	if _, err := os.Stat(scratchPath); os.IsNotExist(err) {
+		if err := wcow.CreateUVMScratch(ctx, uvmFolder, scratchFolder, uvm.id); err != nil {
+			return nil, fmt.Errorf("failed to create scratch: %s", err)
 		}
-
-		doc.VirtualMachine.Devices.Scsi = map[string]hcsschema.Scsi{
-			"0": {
-				Attachments: map[string]hcsschema.Attachment{
-					"0": {
-						Path:  scratchPath,
-						Type_: "VirtualDisk",
-					},
-				},
-			},
-		}
-
-		uvm.scsiLocations[0][0] = newSCSIMount(uvm,
-			doc.VirtualMachine.Devices.Scsi["0"].Attachments["0"].Path,
-			"",
-			doc.VirtualMachine.Devices.Scsi["0"].Attachments["0"].Type_,
-			"",
-			1,
-			0,
-			0,
-			false,
-			false)
 	} else {
-		doc.VirtualMachine.RestoreState = &hcsschema.RestoreState{}
-		doc.VirtualMachine.RestoreState.TemplateSystemId = opts.TemplateConfig.UVMID
-
-		for _, cloneableResource := range opts.TemplateConfig.Resources {
-			err = cloneableResource.Clone(ctx, uvm, &cloneData{
-				doc:           doc,
-				scratchFolder: scratchFolder,
-				uvmID:         opts.ID,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("failed while cloning: %s", err)
-			}
+		// Sandbox.vhdx exists, just need to grant vm access to it.
+		if err := wclayer.GrantVmAccess(ctx, uvm.id, scratchPath); err != nil {
+			return nil, errors.Wrap(err, "failed to grant vm access to scratch")
 		}
-
-		// we add default clone namespace for each clone. Include it here.
-		if uvm.namespaces == nil {
-			uvm.namespaces = make(map[string]*namespaceInfo)
-		}
-		uvm.namespaces[DefaultCloneNetworkNamespaceID] = &namespaceInfo{
-			nics: make(map[string]*nicInfo),
-		}
-		uvm.IsClone = true
-		uvm.TemplateID = opts.TemplateConfig.UVMID
 	}
 
-	// Add appropriate VSMB share options if this UVM needs to be saved as a template
-	if opts.IsTemplate {
-		for _, share := range doc.VirtualMachine.Devices.VirtualSmb.Shares {
-			uvm.SetSaveableVSMBOptions(share.Options, share.Options.ReadOnly)
+	doc.VirtualMachine.Devices.Scsi = map[string]hcsschema.Scsi{}
+	for i := 0; i < int(uvm.scsiControllerCount); i++ {
+		doc.VirtualMachine.Devices.Scsi[guestrequest.ScsiControllerGuids[i]] = hcsschema.Scsi{
+			Attachments: make(map[string]hcsschema.Attachment),
 		}
-		uvm.IsTemplate = true
 	}
+
+	doc.VirtualMachine.Devices.Scsi[guestrequest.ScsiControllerGuids[0]].Attachments["0"] = hcsschema.Attachment{
+
+		Path:  scratchPath,
+		Type_: "VirtualDisk",
+	}
+
+	uvm.reservedSCSISlots = append(uvm.reservedSCSISlots, scsi.Slot{Controller: 0, LUN: 0})
 
 	err = uvm.create(ctx, doc)
 	if err != nil {

@@ -1,4 +1,5 @@
-// +build functional
+//go:build windows && functional
+// +build windows,functional
 
 package cri_containerd
 
@@ -13,7 +14,7 @@ import (
 )
 
 func Test_LCOW_Layer_Integrity(t *testing.T) {
-	requireFeatures(t, featureLCOWIntegrity, featureLCOW)
+	requireFeatures(t, featureLCOW, featureLCOWIntegrity)
 
 	client := newTestRuntimeClient(t)
 	ctx, cancel := context.WithCancel(context.Background())

@@ -1,4 +1,5 @@
-// +build integration
+//go:build windows && integration
+// +build windows,integration
 
 package hcn
 
@@ -12,8 +13,7 @@ import (
 type HcnNetworkMakerFunc func() (*HostComputeNetwork, error)
 
 func TestCreateDeleteNetworks(t *testing.T) {
-	var netMaker HcnNetworkMakerFunc
-	netMaker = HcnCreateTestNATNetwork
+	var netMaker HcnNetworkMakerFunc = HcnCreateTestNATNetwork
 	err := CreateDeleteNetworksHelper(t, netMaker)
 	if err != nil {
 		t.Fatal(err)
@@ -36,6 +36,7 @@ func TestCreateDeleteNetworks(t *testing.T) {
 }
 
 func CreateDeleteNetworksHelper(t *testing.T, networkFunction HcnNetworkMakerFunc) error {
+	t.Helper()
 	network, err := networkFunction()
 	if err != nil {
 		return err
@@ -96,12 +97,13 @@ func TestListNetwork(t *testing.T) {
 }
 
 func testNetworkPolicy(t *testing.T, policiesToTest *PolicyNetworkRequest) {
+	t.Helper()
 	network, err := CreateTestOverlayNetwork()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	network.AddPolicy(*policiesToTest)
+	_ = network.AddPolicy(*policiesToTest)
 
 	//Reload the network object from HNS.
 	network, err = GetNetworkByID(network.Id)
@@ -122,7 +124,7 @@ func testNetworkPolicy(t *testing.T, policiesToTest *PolicyNetworkRequest) {
 		}
 	}
 
-	network.RemovePolicy(*policiesToTest)
+	_ = network.RemovePolicy(*policiesToTest)
 
 	//Reload the network object from HNS.
 	network, err = GetNetworkByID(network.Id)
@@ -150,7 +152,6 @@ func testNetworkPolicy(t *testing.T, policiesToTest *PolicyNetworkRequest) {
 }
 
 func TestAddRemoveRemoteSubnetRoutePolicy(t *testing.T) {
-
 	remoteSubnetRoutePolicy, err := HcnCreateTestRemoteSubnetRoute()
 	if err != nil {
 		t.Fatal(err)
@@ -160,7 +161,6 @@ func TestAddRemoveRemoteSubnetRoutePolicy(t *testing.T) {
 }
 
 func TestAddRemoveHostRoutePolicy(t *testing.T) {
-
 	hostRoutePolicy, err := HcnCreateTestHostRoute()
 	if err != nil {
 		t.Fatal(err)
@@ -169,19 +169,16 @@ func TestAddRemoveHostRoutePolicy(t *testing.T) {
 	testNetworkPolicy(t, hostRoutePolicy)
 }
 
-func TestAddRemoveNetworACLPolicy(t *testing.T){
-
+func TestAddRemoveNetworACLPolicy(t *testing.T) {
 	networkACLPolicy, err := HcnCreateNetworkACLs()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	testNetworkPolicy(t, networkACLPolicy)
-
 }
 
 func TestNetworkFlags(t *testing.T) {
-
 	network, err := CreateTestOverlayNetwork()
 	if err != nil {
 		t.Fatal(err)
@@ -193,8 +190,8 @@ func TestNetworkFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if network.Flags != EnableNonPersistent {
-		t.Errorf("EnableNonPersistent flag (%d) is not set on network", EnableNonPersistent)
+	if network.Flags&EnableNonPersistent == 0 {
+		t.Errorf("EnableNonPersistent flag (%d) is not set on network. Network's flags value: %d", EnableNonPersistent, network.Flags)
 	}
 
 	err = network.Delete()

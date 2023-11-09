@@ -70,6 +70,7 @@ const (
 	// `spec.Windows.Resources.Storage.Iops`.
 	ContainerStorageQoSIopsMaximum = "io.microsoft.container.storage.qos.iopsmaximum"
 
+	// Deprecated: GPU VHDs are no longer supported.
 	// GPUVHDPath overrides the default path to search for the gpu vhd
 	GPUVHDPath = "io.microsoft.lcow.gpuvhdpath"
 
@@ -93,6 +94,12 @@ const (
 
 	// HostProcessContainer indicates to launch a host process container (job container in this repository).
 	HostProcessContainer = "microsoft.com/hostprocess-container"
+
+	// HostProcessRootfsLocation indicates where the rootfs for a host process container should be located. If file binding support is
+	// available (Windows versions 20H1 and up) this will be the absolute path where the rootfs for a container will be located on the host
+	// and will be unique per container. On < 20H1 hosts, the location will be C:\<path-supplied>\<containerID>. So for example, if the value
+	// supplied was C:\rootfs and the container's ID is 12345678 the rootfs will be located at C:\rootfs\12345678.
+	HostProcessRootfsLocation = "microsoft.com/hostprocess-rootfs-location"
 
 	// AllowOvercommit indicates if we should allow over commit memory for UVM.
 	// Defaults to true. For physical backed memory, set to false.
@@ -119,7 +126,7 @@ const (
 	// MemoryHighMMIOBaseInMB indicates the high MMIO base in MB
 	MemoryHighMMIOBaseInMB = "io.microsoft.virtualmachine.computetopology.memory.highmmiobaseinmb"
 
-	// MemoryHighMMIOBaseInMB indicates the high MMIO gap in MB
+	// MemoryHighMMIOGapInMB indicates the high MMIO gap in MB
 	MemoryHighMMIOGapInMB = "io.microsoft.virtualmachine.computetopology.memory.highmmiogapinmb"
 
 	// ProcessorCount overrides the hypervisor isolated vCPU count set
@@ -192,23 +199,11 @@ const (
 	// VSMBNoDirectMap specifies that no direct mapping should be used for any VSMBs added to the UVM
 	VSMBNoDirectMap = "io.microsoft.virtualmachine.wcow.virtualSMB.nodirectmap"
 
+	// DisableWritableFileShares disables adding any writable fileshares to the UVM
+	DisableWritableFileShares = "io.microsoft.virtualmachine.fileshares.disablewritable"
+
 	// CPUGroupID specifies the cpugroup ID that a UVM should be assigned to if any
 	CPUGroupID = "io.microsoft.virtualmachine.cpugroup.id"
-
-	// SaveAsTemplate annotation must be used with a pod & container creation request.
-	// If this annotation is present in the request then it will save the UVM (pod)
-	// and the container(s) inside it as a template. However, this also means that this
-	// pod and the containers inside this pod will permananetly stay in the
-	// paused/templated state and can not be resumed again.
-	SaveAsTemplate = "io.microsoft.virtualmachine.saveastemplate"
-
-	// TemplateID should be used when creating a pod or a container from a template.
-	// When creating a pod from a template use the ID of the templated pod as the
-	// TemplateID and when creating a container use the ID of the templated container as
-	// the TemplateID. It is the client's responsibility to make sure that the sandbox
-	// within which a cloned container needs to be created must also be created from the
-	// same template.
-	TemplateID = "io.microsoft.virtualmachine.templateid"
 
 	// NetworkConfigProxy holds the address of the network config proxy service.
 	// If set, network setup will be attempted via ncproxy.
@@ -225,6 +220,13 @@ const (
 	// SecurityPolicy is used to specify a security policy for opengcs to enforce
 	SecurityPolicy = "io.microsoft.virtualmachine.lcow.securitypolicy"
 
+	// SecurityPolicyEnforcer is used to specify which enforcer to initialize (open-door, standard or rego).
+	// This allows for better fallback mechanics.
+	SecurityPolicyEnforcer = "io.microsoft.virtualmachine.lcow.enforcer"
+
+	// HclEnabled specifies whether to enable the host compatibility layer.
+	HclEnabled = "io.microsoft.virtualmachine.lcow.hcl-enabled"
+
 	// ContainerProcessDumpLocation specifies a path inside of containers to save process dumps to. As
 	// the scratch space for a container is generally cleaned up after exit, this is best set to a volume mount of
 	// some kind (vhd, bind mount, fileshare mount etc.)
@@ -234,6 +236,11 @@ const (
 	// process dump for Windows containers. The supported options are "mini", and "full".
 	// See DumpType: https://docs.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps
 	WCOWProcessDumpType = "io.microsoft.wcow.processdumptype"
+
+	// WCOWProcessDumpCount specifies the maximum number of dumps to be collected in the specified
+	// ContainerProcessDumpLocation path. When the maximum value is exceeded, the oldest dump file in the
+	// folder will be replaced by the new dump file. The default value is 10.
+	WCOWProcessDumpCount = "io.microsoft.wcow.processdumpcount"
 
 	// RLimitCore specifies the core rlimit value for a container. This will need to be set
 	// in order to have core dumps generated for a given container.
@@ -258,11 +265,49 @@ const (
 	// GuestStateFile specifies the path of the vmgs file to use if required. Only applies in SNP mode.
 	GuestStateFile = "io.microsoft.virtualmachine.lcow.gueststatefile"
 
-	// AnnotationDisableLCOWTimeSyncService is used to disable the chronyd time
+	// UVMSecurityPolicyEnv specifies if confidential containers' related information
+	// should be written to containers' rootfs. The filenames and location are defined
+	// by securitypolicy.PolicyFilename, securitypolicy.HostAMDCertFilename and
+	// securitypolicy.ReferenceInfoFilename.
+	UVMSecurityPolicyEnv = "io.microsoft.virtualmachine.lcow.securitypolicy.env"
+
+	// UVMReferenceInfoFile specifies the filename of a signed UVM reference file to be passed to UVM.
+	UVMReferenceInfoFile = "io.microsoft.virtualmachine.lcow.uvm-reference-info-file"
+
+	// HostAMDCertificate specifies the filename of the AMD certificates to be passed to UVM.
+	// The certificate is expected to be located in the same directory as the shim executable.
+	HostAMDCertificate = "io.microsoft.virtualmachine.lcow.amd-certificate"
+
+	// DisableLCOWTimeSyncService is used to disable the chronyd time
 	// synchronization service inside the LCOW UVM.
 	DisableLCOWTimeSyncService = "io.microsoft.virtualmachine.lcow.timesync.disable"
 
 	// NoInheritHostTimezone specifies for the hosts timezone to not be inherited by the WCOW UVM. The UVM will be set to UTC time
 	// as a default.
 	NoInheritHostTimezone = "io.microsoft.virtualmachine.wcow.timezone.noinherit"
+
+	// WCOWDisableGMSA disables providing gMSA (Group Managed Service Accounts) to
+	// a WCOW container
+	WCOWDisableGMSA = "io.microsoft.container.wcow.gmsa.disable"
+
+	// DisableUnsafeOperations disables several unsafe operations, such as writable
+	// file share mounts, for hostile multi-tenant environments. See `AnnotationExpansions`
+	// for more information
+	DisableUnsafeOperations = "io.microsoft.disable-unsafe-operations"
+
+	// DumpDirectoryPath provides a path to the directory in which dumps for a UVM will be collected in
+	// case the UVM crashes.
+	DumpDirectoryPath = "io.microsoft.virtualmachine.dump-directory-path"
 )
+
+// AnnotationExpansions maps annotations that will be expanded into an array of
+// other annotations. The expanded annotations will have the same value as the
+// original. It is an error for the expansions to already exist and have a value
+// that differs from the original.
+var AnnotationExpansions = map[string][]string{
+	DisableUnsafeOperations: {
+		WCOWDisableGMSA,
+		DisableWritableFileShares,
+		VSMBNoDirectMap,
+	},
+}

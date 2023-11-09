@@ -1,8 +1,9 @@
+//go:build windows
+
 package remotevm
 
 import (
 	"context"
-	"io/ioutil"
 	"net"
 	"os"
 
@@ -14,7 +15,7 @@ import (
 
 func (uvm *utilityVM) VMSocketListen(ctx context.Context, listenType vm.VMSocketType, connID interface{}) (_ net.Listener, err error) {
 	// Make a temp file and delete to "reserve" a unique name for the unix socket
-	f, err := ioutil.TempFile("", "")
+	f, err := os.CreateTemp("", "")
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create temp file for unix socket")
 	}

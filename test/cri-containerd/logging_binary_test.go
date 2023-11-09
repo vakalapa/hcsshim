@@ -1,17 +1,18 @@
-// +build functional
+//go:build windows && functional
+// +build windows,functional
 
 package cri_containerd
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Microsoft/hcsshim/test/pkg/require"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
@@ -21,11 +22,12 @@ import (
 // which this test will use to construct logPath for CreateContainerRequest and as
 // the location of stdout artifacts created by the binary
 func Test_Run_Container_With_Binary_Logger(t *testing.T) {
+	requireAnyFeature(t, featureWCOWProcess, featureWCOWHypervisor, featureLCOW)
+	binaryPath := require.Binary(t, "sample-logging-driver.exe")
+
 	client := newTestRuntimeClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	binaryPath := requireBinary(t, "sample-logging-driver.exe")
 
 	logPath := "binary:///" + binaryPath
 
@@ -150,6 +152,7 @@ func Test_Run_Container_With_Binary_Logger(t *testing.T) {
 }
 
 func createAndRunContainer(t *testing.T, client runtime.RuntimeServiceClient, ctx context.Context, conReq *runtime.CreateContainerRequest) {
+	t.Helper()
 	containerID := createContainer(t, client, ctx, conReq)
 	defer removeContainer(t, client, ctx, containerID)
 
@@ -161,7 +164,7 @@ func createAndRunContainer(t *testing.T, client runtime.RuntimeServiceClient, ct
 }
 
 func assertFileContent(path string, content string) (bool, error) {
-	fileContent, err := ioutil.ReadFile(path)
+	fileContent, err := os.ReadFile(path)
 	if err != nil {
 		return false, err
 	}

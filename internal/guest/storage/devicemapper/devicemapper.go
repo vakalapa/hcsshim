@@ -1,8 +1,11 @@
+//go:build linux
 // +build linux
 
 package devicemapper
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -10,7 +13,10 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/Microsoft/hcsshim/internal/log"
 	"golang.org/x/sys/unix"
+
+	"github.com/Microsoft/hcsshim/internal/guest/linux"
 )
 
 // CreateFlags modify the operation of CreateDevice
@@ -26,33 +32,20 @@ var (
 	openMapperWrapper   = openMapper
 )
 
+//nolint:stylecheck // ST1003: ALL_CAPS
 const (
-	_IOC_WRITE    = 1
-	_IOC_READ     = 2
-	_IOC_NRBITS   = 8
-	_IOC_TYPEBITS = 8
-	_IOC_SIZEBITS = 14
-	_IOC_DIRBITS  = 2
-
-	_IOC_NRMASK    = ((1 << _IOC_NRBITS) - 1)
-	_IOC_TYPEMASK  = ((1 << _IOC_TYPEBITS) - 1)
-	_IOC_SIZEMASK  = ((1 << _IOC_SIZEBITS) - 1)
-	_IOC_DIRMASK   = ((1 << _IOC_DIRBITS) - 1)
-	_IOC_TYPESHIFT = (_IOC_NRBITS)
-	_IOC_SIZESHIFT = (_IOC_TYPESHIFT + _IOC_TYPEBITS)
-	_IOC_DIRSHIFT  = (_IOC_SIZESHIFT + _IOC_SIZEBITS)
-
 	_DM_IOCTL      = 0xfd
 	_DM_IOCTL_SIZE = 312
-	_DM_IOCTL_BASE = (_IOC_READ|_IOC_WRITE)<<_IOC_DIRSHIFT | _DM_IOCTL<<_IOC_TYPESHIFT | _DM_IOCTL_SIZE<<_IOC_SIZESHIFT
+	_DM_IOCTL_BASE = linux.IocWRBase | _DM_IOCTL<<linux.IocTypeShift | _DM_IOCTL_SIZE<<linux.IocSizeShift
 
 	_DM_READONLY_FLAG       = 1 << 0
 	_DM_SUSPEND_FLAG        = 1 << 1
 	_DM_PERSISTENT_DEV_FLAG = 1 << 3
-
-	blockSize = 512
 )
 
+const blockSize = 512
+
+//nolint:stylecheck // ST1003: ALL_CAPS
 const (
 	_DM_VERSION = iota
 	_DM_REMOVE_ALL
@@ -109,7 +102,7 @@ type targetSpec struct {
 }
 
 // initIoctl initializes a device-mapper ioctl input struct with the given size
-// and device name
+// and device name.
 func initIoctl(d *dmIoctl, size int, name string) {
 	*d = dmIoctl{
 		Version:  [3]uint32{4, 0, 0},
@@ -131,17 +124,16 @@ func (err *dmError) Error() string {
 	return "device-mapper " + op + ": " + err.Err.Error()
 }
 
-// ioctl issues the specified device-mapper ioctl
-func ioctl(f *os.File, code int, data *dmIoctl) error {
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), uintptr(code|_DM_IOCTL_BASE), uintptr(unsafe.Pointer(data)))
-	if errno != 0 {
-		return &dmError{Op: code, Err: errno}
+// devMapperIoctl issues the specified device-mapper ioctl.
+func devMapperIoctl(f *os.File, code int, data *dmIoctl) error {
+	if err := linux.Ioctl(f, code|_DM_IOCTL_BASE, unsafe.Pointer(data)); err != nil {
+		return &dmError{Op: code, Err: err}
 	}
 	return nil
 }
 
 // openMapper opens the device-mapper control device and validates that it
-// supports the required version
+// supports the required version.
 func openMapper() (f *os.File, err error) {
 	f, err = os.OpenFile("/dev/mapper/control", os.O_RDWR, 0)
 	if err != nil {
@@ -154,7 +146,7 @@ func openMapper() (f *os.File, err error) {
 	}()
 	var d dmIoctl
 	initIoctl(&d, int(unsafe.Sizeof(d)), "")
-	err = ioctl(f, _DM_VERSION, &d)
+	err = devMapperIoctl(f, _DM_VERSION, &d)
 	if err != nil {
 		return nil, err
 	}
@@ -179,11 +171,11 @@ func (t *Target) sizeof() int {
 // LinearTarget constructs a device-mapper target that maps a portion of a block
 // device at the specified offset.
 //
-// Example linear target table:
-// 0 20971520 linear /dev/hda 384
-// |     |      |        |     |
-// start |   target   data_dev |
-//     size                 offset
+//	Example linear target table:
+//	0 20971520 linear /dev/hda 384
+//	|     |      |        |     |
+//	start |   target   data_dev |
+//	     size                 offset
 func LinearTarget(sectorStart, lengthBlocks int64, path string, deviceStart int64) Target {
 	return Target{
 		Type:           "linear",
@@ -194,7 +186,7 @@ func LinearTarget(sectorStart, lengthBlocks int64, path string, deviceStart int6
 }
 
 // zeroSectorLinearTarget creates a Target for devices with 0 sector start and length/device start
-// expected to be in bytes rather than blocks
+// expected to be in bytes rather than blocks.
 func zeroSectorLinearTarget(lengthBytes int64, path string, deviceStartBytes int64) Target {
 	lengthInBlocks := lengthBytes / blockSize
 	startInBlocks := deviceStartBytes / blockSize
@@ -222,9 +214,46 @@ func makeTableIoctl(name string, targets []Target) *dmIoctl {
 		spec.Next = uint32(sn)
 		copy(spec.Type[:], t.Type)
 		copy(b[off+int(unsafe.Sizeof(*spec)):], t.Params)
-		off += int(sn)
+		off += sn
 	}
 	return d
+}
+
+// CreateDeviceWithRetryErrors keeps retrying to create device mapper target
+func CreateDeviceWithRetryErrors(
+	ctx context.Context,
+	name string,
+	flags CreateFlags,
+	targets []Target,
+	errs ...error,
+) (string, error) {
+retry:
+	for {
+		dmPath, err := CreateDevice(name, flags, targets)
+		if err == nil {
+			return dmPath, nil
+		}
+		log.G(ctx).WithError(err).Warning("CreateDevice error")
+		// In some cases
+		dmErr, ok := err.(*dmError)
+		if !ok {
+			return "", err
+		}
+		// check retry-able errors
+		for _, e := range errs {
+			if errors.Is(dmErr.Err, e) {
+				select {
+				case <-ctx.Done():
+					log.G(ctx).WithError(err).Warning("CreateDeviceWithRetryErrors failed, context timeout")
+					return "", err
+				default:
+					time.Sleep(100 * time.Millisecond)
+					continue retry
+				}
+			}
+		}
+		return "", fmt.Errorf("CreateDeviceWithRetryErrors failed: %w", err)
+	}
 }
 
 // CreateDevice creates a device-mapper device with the given target spec. It returns
@@ -239,13 +268,13 @@ func CreateDevice(name string, flags CreateFlags, targets []Target) (_ string, e
 	var d dmIoctl
 	size := int(unsafe.Sizeof(d))
 	initIoctl(&d, size, name)
-	err = ioctl(f, _DM_DEV_CREATE, &d)
+	err = devMapperIoctl(f, _DM_DEV_CREATE, &d)
 	if err != nil {
 		return "", err
 	}
 	defer func() {
 		if err != nil {
-			removeDeviceWrapper(f, name)
+			_ = removeDeviceWrapper(f, name)
 		}
 	}()
 
@@ -255,12 +284,12 @@ func CreateDevice(name string, flags CreateFlags, targets []Target) (_ string, e
 	if flags&CreateReadOnly != 0 {
 		di.Flags |= _DM_READONLY_FLAG
 	}
-	err = ioctl(f, _DM_TABLE_LOAD, di)
+	err = devMapperIoctl(f, _DM_TABLE_LOAD, di)
 	if err != nil {
 		return "", err
 	}
 	initIoctl(&d, size, name)
-	err = ioctl(f, _DM_DEV_SUSPEND, &d)
+	err = devMapperIoctl(f, _DM_DEV_SUSPEND, &d)
 	if err != nil {
 		return "", err
 	}
@@ -291,7 +320,7 @@ func RemoveDevice(name string) (err error) {
 	// target has been unmounted.
 	for i := 0; i < 10; i++ {
 		if err = rm(); err != nil {
-			if e, ok := err.(*dmError); !ok || e.Err != syscall.EBUSY {
+			if e, ok := err.(*dmError); !ok || e.Err != syscall.EBUSY { //nolint:errorlint
 				break
 			}
 			time.Sleep(10 * time.Millisecond)
@@ -299,13 +328,13 @@ func RemoveDevice(name string) (err error) {
 		}
 		break
 	}
-	return
+	return err
 }
 
 func removeDevice(f *os.File, name string) error {
 	var d dmIoctl
 	initIoctl(&d, int(unsafe.Sizeof(d)), name)
-	err := ioctl(f, _DM_DEV_REMOVE, &d)
+	err := devMapperIoctl(f, _DM_DEV_REMOVE, &d)
 	if err != nil {
 		return err
 	}

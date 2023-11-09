@@ -7,11 +7,14 @@ import (
 	"encoding/json"
 	"strconv"
 
-	"github.com/Microsoft/hcsshim/internal/guest/commonutils"
-	"github.com/Microsoft/hcsshim/pkg/securitypolicy"
-	v1 "github.com/containerd/cgroups/stats/v1"
+	v1 "github.com/containerd/cgroups/v3/cgroup1/stats"
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+
+	"github.com/Microsoft/hcsshim/internal/guest/commonutils"
+	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 )
 
 //////////// Code for the Message Header ////////////
@@ -27,7 +30,6 @@ import (
 // III - 12 Bits   Message Id
 // VV  - 8 Bits    Version
 
-//nolint:deadcode,varcheck
 const (
 	messageTypeMask     = 0xF0000000
 	messageCategoryMask = 0x0FF00000
@@ -43,7 +45,7 @@ type MessageType uint32
 const (
 	// MtNone is the default MessageType.
 	MtNone = 0
-	// MtRequest is the MessageType when a request is recieved.
+	// MtRequest is the MessageType when a request is received.
 	MtRequest = 0x10000000
 	// MtResponse is the MessageType used to send a response.
 	MtResponse = 0x20000000
@@ -140,7 +142,7 @@ const (
 	ComputeSystemNotificationV1 = 0x30100101
 )
 
-// String returns the string representation of the message identifer.
+// String returns the string representation of the message identifier.
 func (mi MessageIdentifier) String() string {
 	switch mi {
 	case MiNone:
@@ -217,7 +219,7 @@ const MessageHeaderSize = 16
 
 /////////////////////////////////////////////////////
 
-// ProtocolVersion is a type for the seclected HCS<->GCS protocol version of
+// ProtocolVersion is a type for the selected HCS<->GCS protocol version of
 // messages
 type ProtocolVersion uint32
 
@@ -237,7 +239,7 @@ type ProtocolSupport struct {
 	MaximumProtocolVersion uint32
 }
 
-// OsType defines the operating system type identifer of the guest hosting the
+// OsType defines the operating system type identifier of the guest hosting the
 // GCS.
 type OsType string
 
@@ -499,53 +501,6 @@ type ResourceModificationRequestResponse struct {
 	Settings     interface{} `json:",omitempty"`
 }
 
-// ModifyResourceType is the type of resource, such as memory or virtual disk,
-// which is to be modified for the container. This is the V2 schema equivalent
-// of PropertyType.
-type ModifyResourceType string
-
-const (
-	// MrtMappedDirectory is the modify resource type for mapped directories
-	MrtMappedDirectory = ModifyResourceType("MappedDirectory")
-	// MrtMappedVirtualDisk is the modify resource type for mapped virtual
-	// disks
-	MrtMappedVirtualDisk = ModifyResourceType("MappedVirtualDisk")
-	// MrtCombinedLayers is the modify resource type for combined layers
-	MrtCombinedLayers = ModifyResourceType("CombinedLayers")
-	// MrtVPMemDevice is the modify resource type for VPMem devices
-	MrtVPMemDevice = ModifyResourceType("VPMemDevice")
-	// MrtNetwork is the modify resource type for the `NetworkAdapterV2` device.
-	MrtNetwork = ModifyResourceType("Network")
-	// MrtVPCIDevice is the modify resource type for vpci devices
-	MrtVPCIDevice = ModifyResourceType("VPCIDevice")
-	// MrtContainerConstraints is the modify resource type for updating container constraints
-	MrtContainerConstraints = ModifyResourceType("ContainerConstraints")
-	// MrtSecurityPolicy is the modify resource type for updating the security policy
-	MrtSecurityPolicy = ModifyResourceType("SecurityPolicy")
-)
-
-// ModifyRequestType is the type of operation to perform on a given modify
-// resource type. This is the V2 schema equivalent of RequestType.
-type ModifyRequestType string
-
-const (
-	// MreqtAdd is the "Add" modify request type
-	MreqtAdd = ModifyRequestType("Add")
-	// MreqtRemove is the "Remove" modify request type
-	MreqtRemove = ModifyRequestType("Remove")
-	// MreqtUpdate is the "Update" modify request type
-	MreqtUpdate = ModifyRequestType("Update")
-)
-
-// ModifySettingRequest details a container resource which should be modified,
-// how, and with what parameters. This is the V2 schema equivalent of
-// ResourceModificationRequestResponse.
-type ModifySettingRequest struct {
-	ResourceType ModifyResourceType `json:",omitempty"`
-	RequestType  ModifyRequestType  `json:",omitempty"`
-	Settings     interface{}        `json:",omitempty"`
-}
-
 // ContainerModifySettings is the message from the HCS specifying how a certain
 // container resource should be modified.
 type ContainerModifySettings struct {
@@ -566,7 +521,7 @@ func UnmarshalContainerModifySettings(b []byte) (*ContainerModifySettings, error
 		return nil, errors.Wrap(err, "failed to unmarshal ContainerModifySettings")
 	}
 
-	var msr ModifySettingRequest
+	var msr guestrequest.ModificationRequest
 	var msrRawSettings json.RawMessage
 	msr.Settings = &msrRawSettings
 	if err := commonutils.UnmarshalJSONWithHresult(requestRawSettings, &msr); err != nil {
@@ -574,59 +529,71 @@ func UnmarshalContainerModifySettings(b []byte) (*ContainerModifySettings, error
 	}
 
 	if msr.RequestType == "" {
-		msr.RequestType = MreqtAdd
+		msr.RequestType = guestrequest.RequestTypeAdd
 	}
 
 	// Fill in the ResourceType-specific fields.
 	switch msr.ResourceType {
-	case MrtMappedVirtualDisk:
-		mvd := &MappedVirtualDiskV2{}
+	case guestresource.ResourceTypeSCSIDevice:
+		msd := &guestresource.SCSIDevice{}
+		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, msd); err != nil {
+			return &request, errors.Wrap(err, "failed to unmarshal settings as SCSIDevice")
+		}
+		msr.Settings = msd
+	case guestresource.ResourceTypeMappedVirtualDisk:
+		mvd := &guestresource.LCOWMappedVirtualDisk{}
 		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, mvd); err != nil {
 			return &request, errors.Wrap(err, "failed to unmarshal settings as MappedVirtualDiskV2")
 		}
 		msr.Settings = mvd
-	case MrtMappedDirectory:
-		md := &MappedDirectoryV2{}
+	case guestresource.ResourceTypeMappedDirectory:
+		md := &guestresource.LCOWMappedDirectory{}
 		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, md); err != nil {
 			return &request, errors.Wrap(err, "failed to unmarshal settings as MappedDirectoryV2")
 		}
 		msr.Settings = md
-	case MrtVPMemDevice:
-		vpd := &MappedVPMemDeviceV2{}
+	case guestresource.ResourceTypeVPMemDevice:
+		vpd := &guestresource.LCOWMappedVPMemDevice{}
 		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, vpd); err != nil {
 			return &request, errors.Wrap(err, "failed to unmarshal hosted settings as MappedVPMemDeviceV2")
 		}
 		msr.Settings = vpd
-	case MrtCombinedLayers:
-		cl := &CombinedLayersV2{}
+	case guestresource.ResourceTypeCombinedLayers:
+		cl := &guestresource.LCOWCombinedLayers{}
 		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, cl); err != nil {
 			return &request, errors.Wrap(err, "failed to unmarshal settings as CombinedLayersV2")
 		}
 		msr.Settings = cl
-	case MrtNetwork:
-		na := &NetworkAdapterV2{}
+	case guestresource.ResourceTypeNetwork:
+		na := &guestresource.LCOWNetworkAdapter{}
 		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, na); err != nil {
 			return &request, errors.Wrap(err, "failed to unmarshal settings as NetworkAdapterV2")
 		}
 		msr.Settings = na
-	case MrtVPCIDevice:
-		vd := &MappedVPCIDeviceV2{}
+	case guestresource.ResourceTypeVPCIDevice:
+		vd := &guestresource.LCOWMappedVPCIDevice{}
 		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, vd); err != nil {
 			return &request, errors.Wrap(err, "failed to unmarshal settings as MappedVPCIDeviceV2")
 		}
 		msr.Settings = vd
-	case MrtContainerConstraints:
-		cc := &ContainerConstraintsV2{}
+	case guestresource.ResourceTypeContainerConstraints:
+		cc := &guestresource.LCOWContainerConstraints{}
 		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, cc); err != nil {
 			return &request, errors.Wrap(err, "failed to unmarshal settings as ContainerConstraintsV2")
 		}
 		msr.Settings = cc
-	case MrtSecurityPolicy:
-		policy := &securitypolicy.EncodedSecurityPolicy{}
-		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, policy); err != nil {
-			return &request, errors.Wrap(err, "failed to unmarshal settings as EncodedSecurityPolicy")
+	case guestresource.ResourceTypeSecurityPolicy:
+		enforcer := &guestresource.LCOWConfidentialOptions{}
+		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, enforcer); err != nil {
+			return &request, errors.Wrap(err, "failed to unmarshal settings as LCOWConfidentialOptions")
 		}
-		msr.Settings = policy
+		msr.Settings = enforcer
+	case guestresource.ResourceTypePolicyFragment:
+		fragment := &guestresource.LCOWSecurityPolicyFragment{}
+		if err := commonutils.UnmarshalJSONWithHresult(msrRawSettings, fragment); err != nil {
+			return &request, errors.Wrap(err, "failed to unmarshal settings as LCOWSecurityPolicyFragment")
+		}
+		msr.Settings = fragment
 	default:
 		return &request, errors.Errorf("invalid ResourceType '%s'", msr.ResourceType)
 	}
@@ -662,7 +629,7 @@ func (mrp *MessageResponseBase) Base() *MessageResponseBase {
 }
 
 // NegotiateProtocolResponse is the message to the HCS responding to a
-// NegotiateProtocol message. It specifies the prefered protocol version and
+// NegotiateProtocol message. It specifies the preferred protocol version and
 // available capabilities of the GCS.
 type NegotiateProtocolResponse struct {
 	MessageResponseBase
@@ -709,52 +676,23 @@ type ContainerGetPropertiesResponse struct {
 
 /* types added on to the current official protocol types */
 
-// Layer represents a filesystem layer for a container.
-type Layer struct {
-	// Path is in this case the identifier (such as the SCSI number) of the
-	// layer device.
-	Path string
-}
-
-// CombinedLayersV2 is a modify type that corresponds to MrtCombinedLayers
-// request.
-type CombinedLayersV2 struct {
-	Layers            []Layer `json:",omitempty"`
-	ScratchPath       string  `json:",omitempty"`
-	ContainerRootPath string
-	ContainerId       string `json:",omitempty"`
-}
-
 // NetworkAdapter represents a network interface and its associated
 // configuration.
 type NetworkAdapter struct {
-	AdapterInstanceID  string `json:"AdapterInstanceId"`
-	FirewallEnabled    bool
-	NatEnabled         bool
-	MacAddress         string `json:",omitempty"`
-	AllocatedIPAddress string `json:"AllocatedIpAddress,omitempty"`
-	HostIPAddress      string `json:"HostIpAddress,omitempty"`
-	HostIPPrefixLength uint8  `json:"HostIpPrefixLength,omitempty"`
-	HostDNSServerList  string `json:"HostDnsServerList,omitempty"`
-	HostDNSSuffix      string `json:"HostDnsSuffix,omitempty"`
-	EnableLowMetric    bool   `json:",omitempty"`
-	EncapOverhead      uint16 `json:",omitempty"`
-}
-
-// NetworkAdapterV2 represents a network interface and its associated
-// configuration in a namespace.
-type NetworkAdapterV2 struct {
-	NamespaceID     string `json:",omitempty"`
-	ID              string `json:",omitempty"`
-	MacAddress      string `json:",omitempty"`
-	IPAddress       string `json:",omitempty"`
-	PrefixLength    uint8  `json:",omitempty"`
-	GatewayAddress  string `json:",omitempty"`
-	DNSSuffix       string `json:",omitempty"`
-	DNSServerList   string `json:",omitempty"`
-	EnableLowMetric bool   `json:",omitempty"`
-	EncapOverhead   uint16 `json:",omitempty"`
-	VPCIAssigned    bool   `json:",omitempty"`
+	AdapterInstanceID    string `json:"AdapterInstanceId"`
+	FirewallEnabled      bool
+	NatEnabled           bool
+	MacAddress           string `json:",omitempty"`
+	AllocatedIPAddress   string `json:"AllocatedIpAddress,omitempty"`
+	HostIPAddress        string `json:"HostIpAddress,omitempty"`
+	HostIPPrefixLength   uint8  `json:"HostIpPrefixLength,omitempty"`
+	AllocatedIPv6Address string `json:"AllocatedIpv6Address,omitempty"`
+	HostIPv6Address      string `json:"HostIpv6Address,omitempty"`
+	HostIPv6PrefixLength uint8  `json:"HostIpv6PrefixLength,omitempty"`
+	HostDNSServerList    string `json:"HostDnsServerList,omitempty"`
+	HostDNSSuffix        string `json:"HostDnsSuffix,omitempty"`
+	EnableLowMetric      bool   `json:",omitempty"`
+	EncapOverhead        uint16 `json:",omitempty"`
 }
 
 // MappedVirtualDisk represents a disk on the host which is mapped into a
@@ -767,18 +705,6 @@ type MappedVirtualDisk struct {
 	AttachOnly        bool  `json:",omitempty"`
 }
 
-// MappedVirtualDiskV2 represents a disk on the host which is mapped into a
-// directory in the guest in the V2 schema.
-type MappedVirtualDiskV2 struct {
-	MountPath  string            `json:",omitempty"`
-	Lun        uint8             `json:",omitempty"`
-	Controller uint8             `json:",omitempty"`
-	ReadOnly   bool              `json:",omitempty"`
-	Encrypted  bool              `json:",omitempty"`
-	Options    []string          `json:",omitempty"`
-	VerityInfo *DeviceVerityInfo `json:",omitempty"`
-}
-
 // MappedDirectory represents a directory on the host which is mapped to a
 // directory on the guest through a technology such as Plan9.
 type MappedDirectory struct {
@@ -788,57 +714,10 @@ type MappedDirectory struct {
 	Port              uint32 `json:",omitempty"`
 }
 
-// MappedDirectoryV2 represents a directory on the host which is mapped to a
-// directory on the guest through Plan9 in the V2 schema.
-type MappedDirectoryV2 struct {
-	MountPath string `json:",omitempty"`
-	Port      uint32 `json:",omitempty"`
-	ShareName string `json:",omitempty"`
-	ReadOnly  bool   `json:",omitempty"`
-}
-
-// DeviceMappingInfo represents a mapped device on a given VPMem
-type DeviceMappingInfo struct {
-	DeviceOffsetInBytes int64 `json:",omitempty"`
-	DeviceSizeInBytes   int64 `json:",omitempty"`
-}
-
-// DeviceVerityInfo represents dm-verity information of a given data device.
-// The assumption is that the hash device is the same as data device with
-// verity data appended in the end.
-type DeviceVerityInfo struct {
-	Ext4SizeInBytes int64
-	Version         int
-	Algorithm       string
-	SuperBlock      bool
-	RootDigest      string
-	Salt            string
-	BlockSize       int
-}
-
-// MappedVPMemDeviceV2 represents a VPMem device that is mapped into a guest
-// path in the V2 schema.
-type MappedVPMemDeviceV2 struct {
-	DeviceNumber uint32 `json:",omitempty"`
-	MountPath    string `json:",omitempty"`
-	// MappingInfo is used when multiple devices are mapped onto a single VPMem device
-	MappingInfo *DeviceMappingInfo `json:",omitempty"`
-	VerityInfo  *DeviceVerityInfo  `json:",omitempty"`
-}
-
-type MappedVPCIDeviceV2 struct {
-	VMBusGUID string `json:",omitempty"`
-}
-
-type ContainerConstraintsV2 struct {
-	Windows oci.WindowsResources `json:",omitempty"`
-	Linux   oci.LinuxResources   `json:",omitempty"`
-}
-
 // VMHostedContainerSettings is the set of settings used to specify the initial
 // configuration of a container.
 type VMHostedContainerSettings struct {
-	Layers []Layer
+	Layers []hcsschema.Layer
 	// SandboxDataPath is in this case the identifier (such as the SCSI number)
 	// of the sandbox device.
 	SandboxDataPath    string
@@ -855,9 +734,9 @@ type SchemaVersion struct {
 
 // Cmp compares s and v and returns:
 //
-// -1 if s <  v
-//  0 if s == v
-//  1 if s >  v
+//	-1 if s <  v
+//	0 if s == v
+//	1 if s >  v
 func (s *SchemaVersion) Cmp(v SchemaVersion) int {
 	if s.Major == v.Major {
 		if s.Minor == v.Minor {
@@ -880,6 +759,11 @@ type VMHostedContainerSettingsV2 struct {
 	SchemaVersion    SchemaVersion
 	OCIBundlePath    string    `json:"OciBundlePath,omitempty"`
 	OCISpecification *oci.Spec `json:"OciSpecification,omitempty"`
+	// ScratchDirPath represents the path inside the UVM at which the container scratch
+	// directory is present.  Usually, this is the path at which the container scratch
+	// VHD is mounted inside the UVM. But in case of scratch sharing this is a
+	// directory under the UVM scratch directory.
+	ScratchDirPath string
 }
 
 // ProcessParameters represents any process which may be started in the utility

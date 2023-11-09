@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package hcsv2
@@ -9,13 +10,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pkg/errors"
+	"github.com/vishvananda/netns"
+	"go.opencensus.io/trace"
+
 	"github.com/Microsoft/hcsshim/internal/guest/gcserr"
 	"github.com/Microsoft/hcsshim/internal/guest/network"
 	"github.com/Microsoft/hcsshim/internal/guest/prot"
 	"github.com/Microsoft/hcsshim/internal/oc"
-	"github.com/pkg/errors"
-	"github.com/vishvananda/netns"
-	"go.opencensus.io/trace"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 )
 
 var (
@@ -48,9 +51,9 @@ func getNetworkNamespace(id string) (*namespace, error) {
 	return ns, nil
 }
 
-// getOrAddNetworkNamespace returns the namespace found by `id` or creates a new
+// GetOrAddNetworkNamespace returns the namespace found by `id` or creates a new
 // one and assigns `id.
-func getOrAddNetworkNamespace(id string) *namespace {
+func GetOrAddNetworkNamespace(id string) *namespace {
 	id = strings.ToLower(id)
 
 	namespaceSync.Lock()
@@ -66,9 +69,9 @@ func getOrAddNetworkNamespace(id string) *namespace {
 	return ns
 }
 
-// removeNetworkNamespace removes the in-memory `namespace` found by `id`.
-func removeNetworkNamespace(ctx context.Context, id string) (err error) {
-	_, span := trace.StartSpan(ctx, "hcsv2::removeNetworkNamespace")
+// RemoveNetworkNamespace removes the in-memory `namespace` found by `id`.
+func RemoveNetworkNamespace(ctx context.Context, id string) (err error) {
+	_, span := oc.StartSpan(ctx, "hcsv2::RemoveNetworkNamespace")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
@@ -109,7 +112,7 @@ func (n *namespace) ID() string {
 // assigned adapters into this namespace. The caller MUST call `Sync()` to
 // complete this operation.
 func (n *namespace) AssignContainerPid(ctx context.Context, pid int) (err error) {
-	_, span := trace.StartSpan(ctx, "namespace::AssignContainerPid")
+	_, span := oc.StartSpan(ctx, "namespace::AssignContainerPid")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(
@@ -120,7 +123,7 @@ func (n *namespace) AssignContainerPid(ctx context.Context, pid int) (err error)
 	defer n.m.Unlock()
 
 	if n.pid != 0 {
-		return errors.Errorf("previously assigned container pid: %d", n.pid)
+		return errors.Errorf("previously assigned container pid %d to network namespace %q", n.pid, n.id)
 	}
 
 	n.pid = pid
@@ -129,11 +132,11 @@ func (n *namespace) AssignContainerPid(ctx context.Context, pid int) (err error)
 
 // Adapters returns a copy of the adapters assigned to `n` at the time of the
 // call.
-func (n *namespace) Adapters() []*prot.NetworkAdapterV2 {
+func (n *namespace) Adapters() []*guestresource.LCOWNetworkAdapter {
 	n.m.Lock()
 	defer n.m.Unlock()
 
-	adps := make([]*prot.NetworkAdapterV2, len(n.nics))
+	adps := make([]*guestresource.LCOWNetworkAdapter, len(n.nics))
 	for i, nin := range n.nics {
 		adps[i] = nin.adapter
 	}
@@ -143,8 +146,8 @@ func (n *namespace) Adapters() []*prot.NetworkAdapterV2 {
 // AddAdapter adds `adp` to `n` but does NOT move the adapter into the network
 // namespace assigned to `n`. A user must call `Sync()` to complete this
 // operation.
-func (n *namespace) AddAdapter(ctx context.Context, adp *prot.NetworkAdapterV2) (err error) {
-	ctx, span := trace.StartSpan(ctx, "namespace::AddAdapter")
+func (n *namespace) AddAdapter(ctx context.Context, adp *guestresource.LCOWNetworkAdapter) (err error) {
+	ctx, span := oc.StartSpan(ctx, "namespace::AddAdapter")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(
@@ -176,7 +179,7 @@ func (n *namespace) AddAdapter(ctx context.Context, adp *prot.NetworkAdapterV2) 
 // RemoveAdapter removes the adapter matching `id` from `n`. If `id` is not
 // found returns no error.
 func (n *namespace) RemoveAdapter(ctx context.Context, id string) (err error) {
-	_, span := trace.StartSpan(ctx, "namespace::RemoveAdapter")
+	_, span := oc.StartSpan(ctx, "namespace::RemoveAdapter")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(
@@ -203,7 +206,7 @@ func (n *namespace) RemoveAdapter(ctx context.Context, id string) (err error) {
 
 // Sync moves all adapters to the network namespace of `n` if assigned.
 func (n *namespace) Sync(ctx context.Context) (err error) {
-	ctx, span := trace.StartSpan(ctx, "namespace::Sync")
+	ctx, span := oc.StartSpan(ctx, "namespace::Sync")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute("namespace", n.id))
@@ -231,7 +234,7 @@ func (n *namespace) Sync(ctx context.Context) (err error) {
 // guest and its mapping to the linux `ifname`.
 type nicInNamespace struct {
 	// adapter captures the network settings when the nic was added
-	adapter *prot.NetworkAdapterV2
+	adapter *guestresource.LCOWNetworkAdapter
 	// ifname is the interface name resolved for this adapter
 	ifname string
 	// assignedPid will be `0` for any nic in this namespace that has not been
@@ -241,7 +244,7 @@ type nicInNamespace struct {
 
 // assignToPid assigns `nin.adapter`, represented by `nin.ifname` to `pid`.
 func (nin *nicInNamespace) assignToPid(ctx context.Context, pid int) (err error) {
-	ctx, span := trace.StartSpan(ctx, "nicInNamespace::assignToPid")
+	ctx, span := oc.StartSpan(ctx, "nicInNamespace::assignToPid")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(
@@ -250,12 +253,15 @@ func (nin *nicInNamespace) assignToPid(ctx context.Context, pid int) (err error)
 		trace.Int64Attribute("pid", int64(pid)))
 
 	v1Adapter := &prot.NetworkAdapter{
-		NatEnabled:         nin.adapter.IPAddress != "",
-		AllocatedIPAddress: nin.adapter.IPAddress,
-		HostIPAddress:      nin.adapter.GatewayAddress,
-		HostIPPrefixLength: nin.adapter.PrefixLength,
-		EnableLowMetric:    nin.adapter.EnableLowMetric,
-		EncapOverhead:      nin.adapter.EncapOverhead,
+		NatEnabled:           (nin.adapter.IPAddress != "") || (nin.adapter.IPv6Address != ""),
+		AllocatedIPAddress:   nin.adapter.IPAddress,
+		HostIPAddress:        nin.adapter.GatewayAddress,
+		HostIPPrefixLength:   nin.adapter.PrefixLength,
+		AllocatedIPv6Address: nin.adapter.IPv6Address,
+		HostIPv6Address:      nin.adapter.IPv6GatewayAddress,
+		HostIPv6PrefixLength: nin.adapter.IPv6PrefixLength,
+		EnableLowMetric:      nin.adapter.EnableLowMetric,
+		EncapOverhead:        nin.adapter.EncapOverhead,
 	}
 
 	if err := network.MoveInterfaceToNS(nin.ifname, pid); err != nil {

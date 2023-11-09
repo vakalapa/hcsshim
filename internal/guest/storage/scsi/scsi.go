@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package scsi
@@ -5,41 +6,113 @@ package scsi
 import (
 	"context"
 	"fmt"
-	dm "github.com/Microsoft/hcsshim/internal/guest/storage/devicemapper"
-	"io/ioutil"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/Microsoft/hcsshim/internal/guest/prot"
-	"github.com/Microsoft/hcsshim/internal/guest/storage"
-	"github.com/Microsoft/hcsshim/internal/guest/storage/crypt"
-	"github.com/Microsoft/hcsshim/internal/log"
-	"github.com/Microsoft/hcsshim/internal/oc"
-	"github.com/Microsoft/hcsshim/pkg/securitypolicy"
 	"github.com/pkg/errors"
 	"go.opencensus.io/trace"
 	"golang.org/x/sys/unix"
+
+	"github.com/Microsoft/hcsshim/ext4/tar2ext4"
+	"github.com/Microsoft/hcsshim/internal/guest/storage"
+	"github.com/Microsoft/hcsshim/internal/guest/storage/crypt"
+	dm "github.com/Microsoft/hcsshim/internal/guest/storage/devicemapper"
+	"github.com/Microsoft/hcsshim/internal/guest/storage/ext4"
+	"github.com/Microsoft/hcsshim/internal/guest/storage/xfs"
+	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/internal/oc"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 )
 
-// Test dependencies
+// Test dependencies.
 var (
 	osMkdirAll  = os.MkdirAll
 	osRemoveAll = os.RemoveAll
 	unixMount   = unix.Mount
 
-	// controllerLunToName is stubbed to make testing `Mount` easier.
-	controllerLunToName = ControllerLunToName
-	// createVerityTarget is stubbed for unit testing `Mount`
+	// mock functions for testing getDevicePath
+	osReadDir = os.ReadDir
+	osStat    = os.Stat
+
+	// getDevicePath is stubbed to make testing `Mount` easier.
+	getDevicePath = GetDevicePath
+	// createVerityTarget is stubbed for unit testing `Mount`.
 	createVerityTarget = dm.CreateVerityTarget
-	// removeDevice is stubbed for unit testing `Mount`
+	// removeDevice is stubbed for unit testing `Mount`.
 	removeDevice = dm.RemoveDevice
+	// encryptDevice is stubbed for unit testing `mount`
+	encryptDevice = crypt.EncryptDevice
+	// cleanupCryptDevice is stubbed for unit testing `mount`
+	cleanupCryptDevice = crypt.CleanupCryptDevice
+	// getDeviceFsType is stubbed for unit testing `mount`
+	_getDeviceFsType = getDeviceFsType
+	// storageUnmountPath is stubbed for unit testing `unmount`
+	storageUnmountPath = storage.UnmountPath
+	// tar2ext4.IsDeviceExt4 is stubbed for unit testing `getDeviceFsType`
+	_tar2ext4IsDeviceExt4 = tar2ext4.IsDeviceExt4
+	// ext4Format is stubbed for unit testing the `EnsureFilesystem` flow
+	// in `mount`
+	ext4Format = ext4.Format
+	// ext4Format is stubbed for unit testing the `EnsureFilesystem` and
+	// `Encrypt` flow in `mount`
+	xfsFormat = xfs.Format
 )
 
 const (
-	scsiDevicesPath = "/sys/bus/scsi/devices"
-	verityDeviceFmt = "verity-scsi-contr%d-lun%d-%s"
+	scsiDevicesPath  = "/sys/bus/scsi/devices"
+	vmbusDevicesPath = "/sys/bus/vmbus/devices"
+	verityDeviceFmt  = "dm-verity-scsi-contr%d-lun%d-p%d-%s"
+	cryptDeviceFmt   = "dm-crypt-scsi-contr%d-lun%d-p%d"
 )
+
+// ActualControllerNumber retrieves the actual controller number assigned to a SCSI controller
+// with number `passedController`.
+// When HCS creates the UVM it adds 4 SCSI controllers to the UVM but the 1st SCSI
+// controller according to HCS can actually show up as 2nd, 3rd or 4th controller inside
+// the UVM. So the i'th controller from HCS' perspective could actually be j'th controller
+// inside the UVM. However, we can refer to the SCSI controllers with their GUIDs (that
+// are hardcoded) and then using that GUID find out the SCSI controller number inside the
+// guest. This function does exactly that.
+func ActualControllerNumber(_ context.Context, passedController uint8) (uint8, error) {
+	// find the controller number by looking for a file named host<N> (e.g host1, host3 etc.)
+	// `N` is the controller number.
+	// Full file path would be /sys/bus/vmbus/devices/<controller-guid>/host<N>.
+	controllerDirPath := path.Join(vmbusDevicesPath, guestrequest.ScsiControllerGuids[passedController])
+	entries, err := os.ReadDir(controllerDirPath)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, entry := range entries {
+		baseName := path.Base(entry.Name())
+		if !strings.HasPrefix(baseName, "host") {
+			continue
+		}
+		controllerStr := baseName[len("host"):]
+		controllerNum, err := strconv.ParseUint(controllerStr, 10, 8)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse controller number from %s: %w", baseName, err)
+		}
+		return uint8(controllerNum), nil
+	}
+	return 0, fmt.Errorf("host<N> directory not found inside %s", controllerDirPath)
+}
+
+// Config represents options that are used as part of setup/cleanup before
+// mounting or after unmounting a device. This does not include options
+// that are sent to the mount or unmount calls.
+type Config struct {
+	Encrypted        bool
+	VerityInfo       *guestresource.DeviceVerityInfo
+	EnsureFilesystem bool
+	Filesystem       string
+}
 
 // Mount creates a mount from the SCSI device on `controller` index `lun` to
 // `target`
@@ -47,37 +120,37 @@ const (
 // `target` will be created. On mount failure the created `target` will be
 // automatically cleaned up.
 //
-// If `encrypted` is set to true, the SCSI device will be encrypted using
-// dm-crypt.
-func Mount(ctx context.Context, controller, lun uint8, target string, readonly bool, encrypted bool, options []string, verityInfo *prot.DeviceVerityInfo, securityPolicy securitypolicy.SecurityPolicyEnforcer) (err error) {
-	spnCtx, span := trace.StartSpan(ctx, "scsi::Mount")
+// If the config has `encrypted` is set to true, the SCSI device will be
+// encrypted using dm-crypt.
+func Mount(
+	ctx context.Context,
+	controller,
+	lun uint8,
+	partition uint64,
+	target string,
+	readonly bool,
+	options []string,
+	config *Config) (err error) {
+	spnCtx, span := oc.StartSpan(ctx, "scsi::Mount")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
 	span.AddAttributes(
 		trace.Int64Attribute("controller", int64(controller)),
-		trace.Int64Attribute("lun", int64(lun)))
+		trace.Int64Attribute("lun", int64(lun)),
+		trace.Int64Attribute("partition", int64(partition)),
+	)
 
-	source, err := controllerLunToName(spnCtx, controller, lun)
+	source, err := getDevicePath(spnCtx, controller, lun, partition)
 	if err != nil {
 		return err
 	}
 
 	if readonly {
-		// containers only have read-only layers so only enforce for them
-		var deviceHash string
-		if verityInfo != nil {
-			deviceHash = verityInfo.RootDigest
-		}
-
-		err = securityPolicy.EnforceDeviceMountPolicy(target, deviceHash)
-		if err != nil {
-			return errors.Wrapf(err, "won't mount scsi controller %d lun %d onto %s", controller, lun, target)
-		}
-
-		if verityInfo != nil {
-			dmVerityName := fmt.Sprintf(verityDeviceFmt, controller, lun, deviceHash)
-			if source, err = createVerityTarget(spnCtx, source, dmVerityName, verityInfo); err != nil {
+		if config.VerityInfo != nil {
+			deviceHash := config.VerityInfo.RootDigest
+			dmVerityName := fmt.Sprintf(verityDeviceFmt, controller, lun, partition, deviceHash)
+			if source, err = createVerityTarget(spnCtx, source, dmVerityName, config.VerityInfo); err != nil {
 				return err
 			}
 			defer func() {
@@ -95,7 +168,7 @@ func Mount(ctx context.Context, controller, lun uint8, target string, readonly b
 	}
 	defer func() {
 		if err != nil {
-			osRemoveAll(target)
+			_ = osRemoveAll(target)
 		}
 	}()
 
@@ -107,31 +180,71 @@ func Mount(ctx context.Context, controller, lun uint8, target string, readonly b
 		data = "noload"
 	}
 
-	if encrypted {
-		encryptedSource, err := crypt.EncryptDevice(spnCtx, source)
+	var deviceFS string
+	if config.Encrypted {
+		cryptDeviceName := fmt.Sprintf(cryptDeviceFmt, controller, lun, partition)
+		encryptedSource, err := encryptDevice(spnCtx, source, cryptDeviceName)
 		if err != nil {
-			return errors.Wrapf(err, "failed to mount encrypted device: "+source)
+			// todo (maksiman): add better retry logic, similar to how SCSI device mounts are
+			// retried on unix.ENOENT and unix.ENXIO. The retry should probably be on an
+			// error message rather than actual error, because we shell-out to cryptsetup.
+			time.Sleep(500 * time.Millisecond)
+			if encryptedSource, err = encryptDevice(spnCtx, source, cryptDeviceName); err != nil {
+				return fmt.Errorf("failed to mount encrypted device %s: %w", source, err)
+			}
 		}
 		source = encryptedSource
-	}
-
-	for {
-		if err := unixMount(source, target, "ext4", flags, data); err != nil {
-			// The `source` found by controllerLunToName can take some time
-			// before its actually available under `/dev/sd*`. Retry while we
-			// wait for `source` to show up.
-			if err == unix.ENOENT {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				default:
-					time.Sleep(10 * time.Millisecond)
-					continue
+	} else {
+		// Get the filesystem that is already on the device (if any) and use that
+		// as the mountType unless `Filesystem` was given.
+		deviceFS, err = _getDeviceFsType(source)
+		if err != nil {
+			// TODO (ambarve): add better retry logic, SCSI mounts sometimes return ENONENT or
+			// ENXIO error if we try to open those devices immediately after mount. retry after a
+			// few milliseconds.
+			log.G(ctx).WithError(err).Trace("get device filesystem failed, retrying in 500ms")
+			time.Sleep(500 * time.Millisecond)
+			if deviceFS, err = _getDeviceFsType(source); err != nil {
+				if config.Filesystem == "" || !errors.Is(err, ErrUnknownFilesystem) {
+					return fmt.Errorf("getting device's filesystem: %w", err)
 				}
 			}
-			return err
 		}
-		break
+		log.G(ctx).WithField("filesystem", deviceFS).Debug("filesystem found on device")
+	}
+
+	mountType := deviceFS
+	if config.Filesystem != "" {
+		mountType = config.Filesystem
+	}
+
+	// if EnsureFilesystem is set, then we need to check if the device has the
+	// correct filesystem configured on it. If it does not, format the device
+	// with the corect filesystem. Right now, we only support formatting ext4
+	// and xfs.
+	if config.EnsureFilesystem {
+		// compare the actual fs found on the device to the filesystem requested
+		if deviceFS != config.Filesystem {
+			// re-format device to the correct fs
+			switch config.Filesystem {
+			case "ext4":
+				if err := ext4Format(ctx, source); err != nil {
+					return fmt.Errorf("ext4 format: %w", err)
+				}
+			case "xfs":
+				if err = xfsFormat(source); err != nil {
+					return fmt.Errorf("xfs format: %w", err)
+				}
+			default:
+				return fmt.Errorf("unsupported filesystem %s requested for device", config.Filesystem)
+			}
+		}
+	}
+
+	// device should already be present under /dev, so we should not get an error
+	// unless the command has actually errored out
+	if err := unixMount(source, target, mountType, flags, data); err != nil {
+		return fmt.Errorf("mounting: %w", err)
 	}
 
 	// remount the target to account for propagation flags
@@ -147,65 +260,71 @@ func Mount(ctx context.Context, controller, lun uint8, target string, readonly b
 	return nil
 }
 
-// Unmount unmounts a SCSI device mounted at `target`.
-//
-// If `encrypted` is true, it removes all its associated dm-crypto state.
-func Unmount(ctx context.Context, controller, lun uint8, target string, encrypted bool, verityInfo *prot.DeviceVerityInfo, securityPolicy securitypolicy.SecurityPolicyEnforcer) (err error) {
-	ctx, span := trace.StartSpan(ctx, "scsi::Unmount")
+// Unmount SCSI device mounted at `target`. Cleanup associated dm-verity and
+// dm-crypt devices when necessary.
+func Unmount(
+	ctx context.Context,
+	controller,
+	lun uint8,
+	partition uint64,
+	target string,
+	config *Config,
+) (err error) {
+	ctx, span := oc.StartSpan(ctx, "scsi::Unmount")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
 	span.AddAttributes(
 		trace.Int64Attribute("controller", int64(controller)),
 		trace.Int64Attribute("lun", int64(lun)),
+		trace.Int64Attribute("partition", int64(partition)),
 		trace.StringAttribute("target", target))
 
-	if err = securityPolicy.EnforceDeviceUnmountPolicy(target); err != nil {
-		return errors.Wrapf(err, "unmounting scsi controller %d lun %d from  %s denied by policy", controller, lun, target)
+	// unmount target
+	if err := storageUnmountPath(ctx, target, true); err != nil {
+		return errors.Wrapf(err, "unmount failed: %s", target)
 	}
 
-	// Unmount unencrypted device
-	if err := storage.UnmountPath(ctx, target, true); err != nil {
-		return errors.Wrapf(err, "unmount failed: "+target)
-	}
-
-	if verityInfo != nil {
-		dmVerityName := fmt.Sprintf(verityDeviceFmt, controller, lun, verityInfo.RootDigest)
+	if config.VerityInfo != nil {
+		dmVerityName := fmt.Sprintf(verityDeviceFmt, controller, lun, partition, config.VerityInfo.RootDigest)
 		if err := removeDevice(dmVerityName); err != nil {
 			// Ignore failures, since the path has been unmounted at this point.
 			log.G(ctx).WithError(err).Debugf("failed to remove dm verity target: %s", dmVerityName)
 		}
 	}
 
-	if encrypted {
-		if err := crypt.CleanupCryptDevice(target); err != nil {
-			return errors.Wrapf(err, "failed to cleanup dm-crypt state: "+target)
+	if config.Encrypted {
+		dmCryptName := fmt.Sprintf(cryptDeviceFmt, controller, lun, partition)
+		if err := cleanupCryptDevice(ctx, dmCryptName); err != nil {
+			return fmt.Errorf("failed to cleanup dm-crypt target %s: %w", dmCryptName, err)
 		}
 	}
 
 	return nil
 }
 
-// ControllerLunToName finds the `/dev/sd*` path to the SCSI device on
-// `controller` index `lun`.
-func ControllerLunToName(ctx context.Context, controller, lun uint8) (_ string, err error) {
-	ctx, span := trace.StartSpan(ctx, "scsi::ControllerLunToName")
+// GetDevicePath finds the `/dev/sd*` path to the SCSI device on `controller`
+// index `lun` with partition index `partition` and also ensures that the device
+// is available under that path or context is canceled.
+func GetDevicePath(ctx context.Context, controller, lun uint8, partition uint64) (_ string, err error) {
+	ctx, span := oc.StartSpan(ctx, "scsi::GetDevicePath")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
 	span.AddAttributes(
 		trace.Int64Attribute("controller", int64(controller)),
-		trace.Int64Attribute("lun", int64(lun)))
+		trace.Int64Attribute("lun", int64(lun)),
+		trace.Int64Attribute("partition", int64(partition)),
+	)
 
-	scsiID := fmt.Sprintf("0:0:%d:%d", controller, lun)
-
+	scsiID := fmt.Sprintf("%d:0:0:%d", controller, lun)
 	// Devices matching the given SCSI code should each have a subdirectory
 	// under /sys/bus/scsi/devices/<scsiID>/block.
 	blockPath := filepath.Join(scsiDevicesPath, scsiID, "block")
-	var deviceNames []os.FileInfo
+	var deviceNames []os.DirEntry
 	for {
-		deviceNames, err = ioutil.ReadDir(blockPath)
-		if err != nil && !os.IsNotExist(err) {
+		deviceNames, err = osReadDir(blockPath)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return "", err
 		}
 		if len(deviceNames) == 0 {
@@ -223,9 +342,59 @@ func ControllerLunToName(ctx context.Context, controller, lun uint8) (_ string, 
 	if len(deviceNames) > 1 {
 		return "", errors.Errorf("more than one block device could match SCSI ID \"%s\"", scsiID)
 	}
+	deviceName := deviceNames[0].Name()
 
-	devicePath := filepath.Join("/dev", deviceNames[0].Name())
+	// devices that have partitions have a subdirectory under
+	// /sys/bus/scsi/devices/<scsiID>/block/<deviceName> for each partition.
+	// Partitions use 1-based indexing, so if `partition` is 0, then we should
+	// return the device name without a partition index.
+	if partition != 0 {
+		partitionName := fmt.Sprintf("%s%d", deviceName, partition)
+		partitionPath := filepath.Join(blockPath, deviceName, partitionName)
+
+		// Wait for the device partition to show up
+		for {
+			fi, err := osStat(partitionPath)
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return "", err
+			} else if fi == nil {
+				// if the fileinfo is nil that means we didn't find the device, keep
+				// trying until the context is done or the device path shows up
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				default:
+					time.Sleep(time.Millisecond * 10)
+					continue
+				}
+			}
+			break
+		}
+		deviceName = partitionName
+	}
+
+	devicePath := filepath.Join("/dev", deviceName)
 	log.G(ctx).WithField("devicePath", devicePath).Debug("found device path")
+
+	// devicePath can take some time before its actually available under
+	// `/dev/sd*`. Retry while we wait for it to show up.
+	for {
+		if _, err := osStat(devicePath); err != nil {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ENXIO) {
+				select {
+				case <-ctx.Done():
+					log.G(ctx).Warnf("context timed out while retrying to find device %s: %v", devicePath, err)
+					return "", err
+				default:
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+			}
+			return "", err
+		}
+		break
+	}
+
 	return devicePath, nil
 }
 
@@ -234,7 +403,7 @@ func ControllerLunToName(ctx context.Context, controller, lun uint8) (_ string, 
 //
 // If the device is not attached returns no error.
 func UnplugDevice(ctx context.Context, controller, lun uint8) (err error) {
-	_, span := trace.StartSpan(ctx, "scsi::UnplugDevice")
+	_, span := oc.StartSpan(ctx, "scsi::UnplugDevice")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
@@ -242,7 +411,7 @@ func UnplugDevice(ctx context.Context, controller, lun uint8) (err error) {
 		trace.Int64Attribute("controller", int64(controller)),
 		trace.Int64Attribute("lun", int64(lun)))
 
-	scsiID := fmt.Sprintf("0:0:%d:%d", controller, lun)
+	scsiID := fmt.Sprintf("%d:0:0:%d", controller, lun)
 	f, err := os.OpenFile(filepath.Join(scsiDevicesPath, scsiID, "delete"), os.O_WRONLY, 0644)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -256,4 +425,17 @@ func UnplugDevice(ctx context.Context, controller, lun uint8) (err error) {
 		return err
 	}
 	return nil
+}
+
+var ErrUnknownFilesystem = errors.New("could not get device filesystem type")
+
+// getDeviceFsType finds a device's filesystem.
+// Right now we only support checking for ext4. In the future, this may
+// be expanded to support xfs or other fs types.
+func getDeviceFsType(devicePath string) (string, error) {
+	if _tar2ext4IsDeviceExt4(devicePath) {
+		return "ext4", nil
+	}
+
+	return "", ErrUnknownFilesystem
 }

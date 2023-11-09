@@ -1,3 +1,5 @@
+//go:build windows
+
 package jobcontainers
 
 import (
@@ -5,6 +7,7 @@ import (
 )
 
 func assertEqual(t *testing.T, a uint32, b uint32) {
+	t.Helper()
 	if a != b {
 		t.Fatalf("%d != %d", a, b)
 	}

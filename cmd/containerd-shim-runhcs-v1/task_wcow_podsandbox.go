@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -7,16 +9,16 @@ import (
 
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/stats"
-	"github.com/Microsoft/hcsshim/internal/clone"
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/internal/oc"
 	"github.com/Microsoft/hcsshim/internal/shimdiag"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	eventstypes "github.com/containerd/containerd/api/events"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/runtime"
-	"github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/typeurl"
+	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"go.opencensus.io/trace"
@@ -108,6 +110,10 @@ func (wpst *wcowPodSandboxTask) GetExec(eid string) (shimExec, error) {
 	return nil, errors.Wrapf(errdefs.ErrNotFound, "exec: '%s' in task: '%s' not found", eid, wpst.id)
 }
 
+func (wpst *wcowPodSandboxTask) ListExecs() ([]shimExec, error) {
+	return []shimExec{wpst.init}, nil
+}
+
 func (wpst *wcowPodSandboxTask) KillExec(ctx context.Context, eid string, signal uint32, all bool) error {
 	e, err := wpst.GetExec(eid)
 	if err != nil {
@@ -150,11 +156,11 @@ func (wpst *wcowPodSandboxTask) DeleteExec(ctx context.Context, eid string) (int
 		return 0, 0, time.Time{}, err
 	}
 
-	return int(status.Pid), status.ExitStatus, status.ExitedAt, nil
+	return int(status.Pid), status.ExitStatus, status.ExitedAt.AsTime(), nil
 }
 
-func (wpst *wcowPodSandboxTask) Pids(ctx context.Context) ([]options.ProcessDetails, error) {
-	return []options.ProcessDetails{
+func (wpst *wcowPodSandboxTask) Pids(ctx context.Context) ([]*options.ProcessDetails, error) {
+	return []*options.ProcessDetails{
 		{
 			ProcessID: uint32(wpst.init.Pid()),
 			ExecID:    wpst.init.ID(),
@@ -185,10 +191,6 @@ func (wpst *wcowPodSandboxTask) close(ctx context.Context) {
 			if err := wpst.host.Close(); err != nil {
 				log.G(ctx).WithError(err).Error("failed host vm shutdown")
 			}
-			// cleanup template state if any exists
-			if err := clone.RemoveSavedTemplateConfig(wpst.host.ID()); err != nil {
-				log.G(ctx).WithError(err).Error("failed to cleanup template config state for vm")
-			}
 		}
 		// Send the `init` exec exit notification always.
 		exit := wpst.init.Status()
@@ -210,7 +212,7 @@ func (wpst *wcowPodSandboxTask) close(ctx context.Context) {
 }
 
 func (wpst *wcowPodSandboxTask) waitInitExit() {
-	ctx, span := trace.StartSpan(context.Background(), "wcowPodSandboxTask::waitInitExit")
+	ctx, span := oc.StartSpan(context.Background(), "wcowPodSandboxTask::waitInitExit")
 	defer span.End()
 	span.AddAttributes(trace.StringAttribute("tid", wpst.id))
 
@@ -222,11 +224,11 @@ func (wpst *wcowPodSandboxTask) waitInitExit() {
 }
 
 func (wpst *wcowPodSandboxTask) waitParentExit() {
-	ctx, span := trace.StartSpan(context.Background(), "wcowPodSandboxTask::waitParentExit")
+	ctx, span := oc.StartSpan(context.Background(), "wcowPodSandboxTask::waitParentExit")
 	defer span.End()
 	span.AddAttributes(trace.StringAttribute("tid", wpst.id))
 
-	werr := wpst.host.Wait()
+	werr := wpst.host.WaitCtx(ctx)
 	if werr != nil {
 		log.G(ctx).WithError(werr).Error("parent wait failed")
 	}
@@ -280,7 +282,7 @@ func (wpst *wcowPodSandboxTask) Update(ctx context.Context, req *task.UpdateTask
 		return err
 	}
 
-	return wpst.host.UpdateConstraints(ctx, resources, req.Annotations)
+	return wpst.host.Update(ctx, resources, req.Annotations)
 }
 
 func (wpst *wcowPodSandboxTask) Share(ctx context.Context, req *shimdiag.ShareRequest) error {
@@ -301,4 +303,13 @@ func (wpst *wcowPodSandboxTask) Stats(ctx context.Context) (*stats.Statistics, e
 	}
 	stats.VM = vmStats
 	return stats, nil
+}
+
+func (wpst *wcowPodSandboxTask) ProcessorInfo(ctx context.Context) (*processorInfo, error) {
+	if wpst.host == nil {
+		return nil, errTaskNotIsolated
+	}
+	return &processorInfo{
+		count: wpst.host.ProcessorCount(),
+	}, nil
 }

@@ -1,4 +1,5 @@
-// +build functional
+//go:build windows && functional
+// +build windows,functional
 
 package cri_containerd
 
@@ -7,15 +8,16 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/Microsoft/hcsshim/internal/cpugroup"
-	"github.com/Microsoft/hcsshim/internal/processorinfo"
-	"github.com/Microsoft/hcsshim/osversion"
+	"github.com/Microsoft/hcsshim/internal/memory"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
-	testutilities "github.com/Microsoft/hcsshim/test/functional/utilities"
+	"github.com/Microsoft/hcsshim/test/pkg/definitions/cpugroup"
+	"github.com/Microsoft/hcsshim/test/pkg/definitions/processorinfo"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 func Test_Pod_UpdateResources_Memory(t *testing.T) {
+	requireAnyFeature(t, featureLCOW, featureWCOWHypervisor)
+
 	type config struct {
 		name             string
 		requiredFeatures []string
@@ -46,7 +48,7 @@ func Test_Pod_UpdateResources_Memory(t *testing.T) {
 			} else {
 				pullRequiredImages(t, []string{test.sandboxImage})
 			}
-			var startingMemorySize int64 = 768 * 1024 * 1024
+			var startingMemorySize int64 = 768 * memory.MiB
 			podRequest := getRunPodSandboxRequest(
 				t,
 				test.runtimeHandler,
@@ -87,6 +89,8 @@ func Test_Pod_UpdateResources_Memory(t *testing.T) {
 }
 
 func Test_Pod_UpdateResources_Memory_PA(t *testing.T) {
+	requireAnyFeature(t, featureLCOW, featureWCOWHypervisor)
+
 	type config struct {
 		name             string
 		requiredFeatures []string
@@ -117,7 +121,7 @@ func Test_Pod_UpdateResources_Memory_PA(t *testing.T) {
 			} else {
 				pullRequiredImages(t, []string{test.sandboxImage})
 			}
-			var startingMemorySize int64 = 200 * 1024 * 1024
+			var startingMemorySize int64 = 200 * memory.MiB
 			podRequest := getRunPodSandboxRequest(
 				t,
 				test.runtimeHandler,
@@ -159,6 +163,8 @@ func Test_Pod_UpdateResources_Memory_PA(t *testing.T) {
 }
 
 func Test_Pod_UpdateResources_CPUShares(t *testing.T) {
+	requireAnyFeature(t, featureLCOW, featureWCOWHypervisor)
+
 	type config struct {
 		name             string
 		requiredFeatures []string
@@ -221,7 +227,9 @@ func Test_Pod_UpdateResources_CPUShares(t *testing.T) {
 }
 
 func Test_Pod_UpdateResources_CPUGroup(t *testing.T) {
-	testutilities.RequiresBuild(t, osversion.V21H1)
+	t.Skip("Skipping for now")
+	requireAnyFeature(t, featureLCOW, featureWCOWHypervisor)
+
 	ctx := context.Background()
 
 	processorTopology, err := processorinfo.HostProcessorInfo(ctx)

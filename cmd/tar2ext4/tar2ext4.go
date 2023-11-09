@@ -4,18 +4,18 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 
 	"github.com/Microsoft/hcsshim/ext4/tar2ext4"
 )
 
 var (
-	input      = flag.String("i", "", "input file")
-	output     = flag.String("o", "", "output file")
-	overlay    = flag.Bool("overlay", false, "produce overlayfs-compatible layer image")
-	vhd        = flag.Bool("vhd", false, "add a VHD footer to the end of the image")
-	inlineData = flag.Bool("inline", false, "write small file data into the inode; not compatible with DAX")
+	input        = flag.String("i", "", "input file")
+	output       = flag.String("o", "", "output file")
+	overlay      = flag.Bool("overlay", false, "produce overlayfs-compatible layer image")
+	convertSlash = flag.Bool("convert-slash", false, "convert backslashes ('\\') in path names to slashes ('/')")
+	vhd          = flag.Bool("vhd", false, "add a VHD footer to the end of the image")
+	inlineData   = flag.Bool("inline", false, "write small file data into the inode; not compatible with DAX")
 )
 
 func main() {
@@ -42,6 +42,9 @@ func main() {
 		if *overlay {
 			opts = append(opts, tar2ext4.ConvertWhiteout)
 		}
+		if *convertSlash {
+			opts = append(opts, tar2ext4.ConvertBackslash)
+		}
 		if *vhd {
 			opts = append(opts, tar2ext4.AppendVhdFooter)
 		}
@@ -54,7 +57,7 @@ func main() {
 		}
 
 		// Exhaust the tar stream.
-		_, _ = io.Copy(ioutil.Discard, in)
+		_, _ = io.Copy(io.Discard, in)
 		return nil
 	}()
 	if err != nil {

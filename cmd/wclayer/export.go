@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -38,7 +40,7 @@ var exportCommand = cli.Command{
 			return err
 		}
 
-		layers, err := normalizeLayers(cliContext.StringSlice("layer"), true)
+		layers, err := normalizeLayers(cliContext.StringSlice("layer"), false)
 		if err != nil {
 			return err
 		}

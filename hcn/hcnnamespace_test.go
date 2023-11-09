@@ -1,4 +1,5 @@
-// +build integration
+//go:build windows && integration
+// +build windows,integration
 
 package hcn
 
@@ -12,6 +13,7 @@ import (
 )
 
 func newGUID(t *testing.T) guid.GUID {
+	t.Helper()
 	g, err := guid.NewV4()
 	if err != nil {
 		t.Fatal(err)
@@ -397,7 +399,7 @@ func TestSyncNamespaceGuest(t *testing.T) {
 	pnc := cni.NewPersistedNamespaceConfig(t.Name(), "test-container", newGUID(t))
 	err = pnc.Store()
 	if err != nil {
-		pnc.Remove()
+		_ = pnc.Remove()
 		t.Fatal(err)
 	}
 
@@ -437,7 +439,7 @@ func TestSyncNamespaceGuestDefault(t *testing.T) {
 	pnc := cni.NewPersistedNamespaceConfig(t.Name(), "test-container", newGUID(t))
 	err = pnc.Store()
 	if err != nil {
-		pnc.Remove()
+		_ = pnc.Remove()
 		t.Fatal(err)
 	}
 

@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package hcsv2
@@ -8,29 +9,35 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Microsoft/hcsshim/internal/oc"
-	"github.com/Microsoft/hcsshim/pkg/annotations"
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"go.opencensus.io/trace"
 	"golang.org/x/sys/unix"
+
+	specInternal "github.com/Microsoft/hcsshim/internal/guest/spec"
+	"github.com/Microsoft/hcsshim/internal/guestpath"
+	"github.com/Microsoft/hcsshim/internal/oc"
+	"github.com/Microsoft/hcsshim/pkg/annotations"
 )
 
-func getWorkloadRootDir(id string) string {
-	return filepath.Join("/run/gcs/c", id)
+// os.MkdirAll combines the given permissions with the running process's
+// umask. By default this causes 0777 to become 0755.
+// Temporarily set the umask of this process to 0 so that we can actually
+// make all dirs with os.ModePerm permissions.
+func mkdirAllModePerm(target string) error {
+	savedUmask := unix.Umask(0)
+	defer unix.Umask(savedUmask)
+	return os.MkdirAll(target, os.ModePerm)
 }
 
 func updateSandboxMounts(sbid string, spec *oci.Spec) error {
-	sandboxMountPrefix := "sandbox://"
 	for i, m := range spec.Mounts {
-		if strings.HasPrefix(m.Source, sandboxMountPrefix) {
-			mountsDir := getSandboxMountsDir(sbid)
-			subPath := strings.TrimPrefix(m.Source, sandboxMountPrefix)
-			sandboxSource := filepath.Join(mountsDir, subPath)
+		if strings.HasPrefix(m.Source, guestpath.SandboxMountPrefix) {
+			sandboxSource := specInternal.SandboxMountSource(sbid, m.Source)
 
-			// filepath.Join cleans the resulting path before returning so it would resolve the relative path if one was given.
+			// filepath.Join cleans the resulting path before returning, so it would resolve the relative path if one was given.
 			// Hence, we need to ensure that the resolved path is still under the correct directory
-			if !strings.HasPrefix(sandboxSource, mountsDir) {
+			if !strings.HasPrefix(sandboxSource, specInternal.SandboxMountsDir(sbid)) {
 				return errors.Errorf("mount path %v for mount %v is not within sandbox's mounts dir", sandboxSource, m.Source)
 			}
 
@@ -38,13 +45,7 @@ func updateSandboxMounts(sbid string, spec *oci.Spec) error {
 
 			_, err := os.Stat(sandboxSource)
 			if os.IsNotExist(err) {
-				// os.MkdirAll combines the given permissions with the running process's
-				// umask. By default this causes 0777 to become 0755.
-				// Temporarily set the umask of this process to 0 so that we can actually
-				// make all dirs with os.ModePerm permissions.
-				savedUmask := unix.Umask(0)
-				defer unix.Umask(savedUmask)
-				if err := os.MkdirAll(sandboxSource, os.ModePerm); err != nil {
+				if err := mkdirAllModePerm(sandboxSource); err != nil {
 					return err
 				}
 			}
@@ -54,11 +55,10 @@ func updateSandboxMounts(sbid string, spec *oci.Spec) error {
 }
 
 func updateHugePageMounts(sbid string, spec *oci.Spec) error {
-	mountPrefix := "hugepages://"
 	for i, m := range spec.Mounts {
-		if strings.HasPrefix(m.Source, mountPrefix) {
-			mountsDir := getSandboxHugePageMountsDir(sbid)
-			subPath := strings.TrimPrefix(m.Source, mountPrefix)
+		if strings.HasPrefix(m.Source, guestpath.HugePagesMountPrefix) {
+			mountsDir := specInternal.HugePagesMountsDir(sbid)
+			subPath := strings.TrimPrefix(m.Source, guestpath.HugePagesMountPrefix)
 			pageSize := strings.Split(subPath, string(os.PathSeparator))[0]
 			hugePageMountSource := filepath.Join(mountsDir, subPath)
 
@@ -72,16 +72,9 @@ func updateHugePageMounts(sbid string, spec *oci.Spec) error {
 
 			_, err := os.Stat(hugePageMountSource)
 			if os.IsNotExist(err) {
-				// os.MkdirAll combines the given permissions with the running process's
-				// umask. By default this causes 0777 to become 0755.
-				// Temporarily set the umask of this process to 0 so that we can actually
-				// make all dirs with os.ModePerm permissions.
-				savedUmask := unix.Umask(0)
-				defer unix.Umask(savedUmask)
-				if err := os.MkdirAll(hugePageMountSource, os.ModePerm); err != nil {
+				if err := mkdirAllModePerm(hugePageMountSource); err != nil {
 					return err
 				}
-
 				if err := unix.Mount("none", hugePageMountSource, "hugetlbfs", 0, "pagesize="+pageSize); err != nil {
 					return errors.Errorf("mount operation failed for %v failed with error %v", hugePageMountSource, err)
 				}
@@ -101,7 +94,7 @@ func specHasGPUDevice(spec *oci.Spec) bool {
 }
 
 func setupWorkloadContainerSpec(ctx context.Context, sbid, id string, spec *oci.Spec) (err error) {
-	ctx, span := trace.StartSpan(ctx, "hcsv2::setupWorkloadContainerSpec")
+	ctx, span := oc.StartSpan(ctx, "hcsv2::setupWorkloadContainerSpec")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(
@@ -122,47 +115,10 @@ func setupWorkloadContainerSpec(ctx context.Context, sbid, id string, spec *oci.
 		return errors.Wrapf(err, "failed to update hugepages mounts for container %v in sandbox %v", id, sbid)
 	}
 
-	// Add /etc/hostname if the spec did not override it.
-	if !isInMounts("/etc/hostname", spec.Mounts) {
-		mt := oci.Mount{
-			Destination: "/etc/hostname",
-			Type:        "bind",
-			Source:      getSandboxHostnamePath(sbid),
-			Options:     []string{"bind"},
-		}
-		if isRootReadonly(spec) {
-			mt.Options = append(mt.Options, "ro")
-		}
-		spec.Mounts = append(spec.Mounts, mt)
-	}
-
-	// Add /etc/hosts if the spec did not override it.
-	if !isInMounts("/etc/hosts", spec.Mounts) {
-		mt := oci.Mount{
-			Destination: "/etc/hosts",
-			Type:        "bind",
-			Source:      getSandboxHostsPath(sbid),
-			Options:     []string{"bind"},
-		}
-		if isRootReadonly(spec) {
-			mt.Options = append(mt.Options, "ro")
-		}
-		spec.Mounts = append(spec.Mounts, mt)
-	}
-
-	// Add /etc/resolv.conf if the spec did not override it.
-	if !isInMounts("/etc/resolv.conf", spec.Mounts) {
-		mt := oci.Mount{
-			Destination: "/etc/resolv.conf",
-			Type:        "bind",
-			Source:      getSandboxResolvPath(sbid),
-			Options:     []string{"bind"},
-		}
-		if isRootReadonly(spec) {
-			mt.Options = append(mt.Options, "ro")
-		}
-		spec.Mounts = append(spec.Mounts, mt)
-	}
+	// Add default mounts for container networking (e.g. /etc/hostname, /etc/hosts),
+	// if spec didn't override them explicitly.
+	networkingMounts := specInternal.GenerateWorkloadContainerNetworkMounts(sbid, spec)
+	spec.Mounts = append(spec.Mounts, networkingMounts...)
 
 	// TODO: JTERRY75 /dev/shm is not properly setup for LCOW I believe. CRI
 	// also has a concept of a sandbox/shm file when the IPC NamespaceMode !=
@@ -192,14 +148,9 @@ func setupWorkloadContainerSpec(ctx context.Context, sbid, id string, spec *oci.
 	spec.Linux.CgroupsPath = "/containers/" + id
 
 	if spec.Windows != nil {
+		// we only support Nvidia gpus right now
 		if specHasGPUDevice(spec) {
-			// we only support Nvidia gpus right now
-			ldConfigargs := []string{"-l", "/run/nvidia/lib"}
-			env := updateEnvWithNvidiaVariables()
-			if err := addLDConfigHook(ctx, spec, ldConfigargs, env); err != nil {
-				return err
-			}
-			if err := addNvidiaDevicePreHook(ctx, spec); err != nil {
+			if err := addNvidiaDeviceHook(ctx, spec); err != nil {
 				return err
 			}
 		}

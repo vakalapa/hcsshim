@@ -1,15 +1,17 @@
+//go:build windows
+
 package main
 
 import (
 	gcontext "context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"syscall"
 
-	winio "github.com/Microsoft/go-winio"
+	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/hcsshim/internal/appargs"
 	"github.com/Microsoft/hcsshim/internal/logfields"
 	"github.com/Microsoft/hcsshim/internal/runhcs"
@@ -48,7 +50,7 @@ var vmshimCommand = cli.Command{
 
 		pipePath := context.Args().First()
 
-		optsj, err := ioutil.ReadAll(os.Stdin)
+		optsj, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -99,7 +101,7 @@ var vmshimCommand = cli.Command{
 		// successfully.
 		os.Stdout.Write(runhcs.ShimSuccess)
 		os.Stdout.Close()
-		fatalWriter.Writer = ioutil.Discard
+		fatalWriter.Writer = io.Discard
 
 		pipeCh := make(chan net.Conn)
 		go func() {
@@ -128,7 +130,7 @@ var vmshimCommand = cli.Command{
 						err = closeWritePipe(pipe)
 					}
 					if err == nil {
-						_, _ = ioutil.ReadAll(pipe)
+						_, _ = io.ReadAll(pipe)
 					}
 				} else {
 					logrus.WithError(err).

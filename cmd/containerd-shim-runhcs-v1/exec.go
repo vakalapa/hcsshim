@@ -1,10 +1,12 @@
+//go:build windows
+
 package main
 
 import (
 	"context"
 
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/runtime/v2/task"
 	"github.com/pkg/errors"
 )
 

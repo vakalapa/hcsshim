@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -11,6 +13,7 @@ import (
 )
 
 func setupTestHcsTask(t *testing.T) (*hcsTask, *testShimExec, *testShimExec) {
+	t.Helper()
 	initExec := newTestShimExec(t.Name(), t.Name(), int(rand.Int31()))
 	lt := &hcsTask{
 		events: newFakePublisher(),
@@ -125,6 +128,7 @@ func Test_hcsTask_KillExec_2ndExecID_All_Error(t *testing.T) {
 }
 
 func verifyDeleteFailureValues(t *testing.T, pid int, status uint32, at time.Time) {
+	t.Helper()
 	if pid != 0 {
 		t.Fatalf("pid expected '0' got: '%d'", pid)
 	}
@@ -137,13 +141,14 @@ func verifyDeleteFailureValues(t *testing.T, pid int, status uint32, at time.Tim
 }
 
 func verifyDeleteSuccessValues(t *testing.T, pid int, status uint32, at time.Time, e *testShimExec) {
+	t.Helper()
 	if pid != e.pid {
 		t.Fatalf("pid expected '%d' got: '%d'", e.pid, pid)
 	}
 	if status != e.status {
 		t.Fatalf("status expected '%d' got: '%d'", e.status, status)
 	}
-	if at != e.at {
+	if !at.Equal(e.at) {
 		t.Fatalf("at expected '%v' got: '%v'", e.at, at)
 	}
 }
@@ -161,6 +166,8 @@ func Test_hcsTask_DeleteExec_InitExecID_CreatedState_Success(t *testing.T) {
 	// remove the 2nd exec so we just check without it.
 	lt.execs.Delete(second.id)
 
+	// Simulate waitInitExit() closing the host
+	close(lt.closed)
 	// try to delete the init exec
 	pid, status, at, err := lt.DeleteExec(context.TODO(), "")
 
@@ -178,6 +185,8 @@ func Test_hcsTask_DeleteExec_InitExecID_RunningState_Error(t *testing.T) {
 	// Start the init exec
 	_ = init.Start(context.TODO())
 
+	// Simulate waitInitExit() closing the host
+	close(lt.closed)
 	// try to delete the init exec
 	pid, status, at, err := lt.DeleteExec(context.TODO(), "")
 
@@ -192,6 +201,8 @@ func Test_hcsTask_DeleteExec_InitExecID_ExitedState_Success(t *testing.T) {
 
 	_ = init.Kill(context.TODO(), 0xf)
 
+	// Simulate waitInitExit() closing the host
+	close(lt.closed)
 	// try to delete the init exec
 	pid, status, at, err := lt.DeleteExec(context.TODO(), "")
 
@@ -207,6 +218,8 @@ func Test_hcsTask_DeleteExec_InitExecID_2ndExec_CreatedState_Error(t *testing.T)
 	// start the init exec (required to have 2nd exec)
 	_ = init.Start(context.TODO())
 
+	// Simulate waitInitExit() closing the host
+	close(lt.closed)
 	// try to delete the init exec
 	pid, status, at, err := lt.DeleteExec(context.TODO(), "")
 
@@ -226,6 +239,8 @@ func Test_hcsTask_DeleteExec_InitExecID_2ndExec_RunningState_Error(t *testing.T)
 	// put the 2nd exec into the running state
 	_ = second.Start(context.TODO())
 
+	// Simulate waitInitExit() closing the host
+	close(lt.closed)
 	// try to delete the init exec
 	pid, status, at, err := lt.DeleteExec(context.TODO(), "")
 
@@ -244,6 +259,8 @@ func Test_hcsTask_DeleteExec_InitExecID_2ndExec_ExitedState_Success(t *testing.T
 	// put the 2nd exec into the exited state
 	_ = second.Kill(context.TODO(), 0xf)
 
+	// Simulate waitInitExit() closing the host
+	close(lt.closed)
 	// try to delete the init exec
 	pid, status, at, err := lt.DeleteExec(context.TODO(), "")
 

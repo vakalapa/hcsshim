@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package hcsv2
@@ -6,12 +7,12 @@ import (
 	"context"
 	"testing"
 
-	"github.com/Microsoft/hcsshim/internal/guest/prot"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 )
 
 func Test_getNetworkNamespace_NotExist(t *testing.T) {
 	defer func() {
-		err := removeNetworkNamespace(context.Background(), t.Name())
+		err := RemoveNetworkNamespace(context.Background(), t.Name())
 		if err != nil {
 			t.Errorf("failed to remove ns with error: %v", err)
 		}
@@ -28,13 +29,13 @@ func Test_getNetworkNamespace_NotExist(t *testing.T) {
 
 func Test_getNetworkNamespace_PreviousExist(t *testing.T) {
 	defer func() {
-		err := removeNetworkNamespace(context.Background(), t.Name())
+		err := RemoveNetworkNamespace(context.Background(), t.Name())
 		if err != nil {
 			t.Errorf("failed to remove ns with error: %v", err)
 		}
 	}()
 
-	ns1 := getOrAddNetworkNamespace(t.Name())
+	ns1 := GetOrAddNetworkNamespace(t.Name())
 	if ns1 == nil {
 		t.Fatal("namespace ns1 should not be nil")
 	}
@@ -49,13 +50,13 @@ func Test_getNetworkNamespace_PreviousExist(t *testing.T) {
 
 func Test_getOrAddNetworkNamespace_NotExist(t *testing.T) {
 	defer func() {
-		err := removeNetworkNamespace(context.Background(), t.Name())
+		err := RemoveNetworkNamespace(context.Background(), t.Name())
 		if err != nil {
 			t.Errorf("failed to remove ns with error: %v", err)
 		}
 	}()
 
-	ns := getOrAddNetworkNamespace(t.Name())
+	ns := GetOrAddNetworkNamespace(t.Name())
 	if ns == nil {
 		t.Fatalf("namespace should not be nil")
 	}
@@ -63,21 +64,21 @@ func Test_getOrAddNetworkNamespace_NotExist(t *testing.T) {
 
 func Test_getOrAddNetworkNamespace_PreviousExist(t *testing.T) {
 	defer func() {
-		err := removeNetworkNamespace(context.Background(), t.Name())
+		err := RemoveNetworkNamespace(context.Background(), t.Name())
 		if err != nil {
 			t.Errorf("failed to remove ns with error: %v", err)
 		}
 	}()
 
-	ns1 := getOrAddNetworkNamespace(t.Name())
-	ns2 := getOrAddNetworkNamespace(t.Name())
+	ns1 := GetOrAddNetworkNamespace(t.Name())
+	ns2 := GetOrAddNetworkNamespace(t.Name())
 	if ns1 != ns2 {
 		t.Fatalf("ns1 %+v != ns2 %+v", ns1, ns2)
 	}
 }
 
 func Test_removeNetworkNamespace_NotExist(t *testing.T) {
-	err := removeNetworkNamespace(context.Background(), t.Name())
+	err := RemoveNetworkNamespace(context.Background(), t.Name())
 	if err != nil {
 		t.Fatalf("failed to remove non-existing ns with error: %v", err)
 	}
@@ -85,7 +86,7 @@ func Test_removeNetworkNamespace_NotExist(t *testing.T) {
 
 func Test_removeNetworkNamespace_HasAdapters(t *testing.T) {
 	defer func() {
-		err := removeNetworkNamespace(context.Background(), t.Name())
+		err := RemoveNetworkNamespace(context.Background(), t.Name())
 		if err != nil {
 			t.Errorf("failed to remove ns with error: %v", err)
 		}
@@ -95,16 +96,16 @@ func Test_removeNetworkNamespace_HasAdapters(t *testing.T) {
 		networkInstanceIDToName = nsOld
 	}()
 
-	ns := getOrAddNetworkNamespace(t.Name())
+	ns := GetOrAddNetworkNamespace(t.Name())
 
 	networkInstanceIDToName = func(ctx context.Context, id string, _ bool) (string, error) {
 		return "/dev/sdz", nil
 	}
-	err := ns.AddAdapter(context.Background(), &prot.NetworkAdapterV2{ID: "test"})
+	err := ns.AddAdapter(context.Background(), &guestresource.LCOWNetworkAdapter{ID: "test"})
 	if err != nil {
 		t.Fatalf("failed to add adapter: %v", err)
 	}
-	err = removeNetworkNamespace(context.Background(), t.Name())
+	err = RemoveNetworkNamespace(context.Background(), t.Name())
 	if err == nil {
 		t.Fatal("should have failed to delete namespace with adapters")
 	}
@@ -112,7 +113,7 @@ func Test_removeNetworkNamespace_HasAdapters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to remove adapter: %v", err)
 	}
-	err = removeNetworkNamespace(context.Background(), t.Name())
+	err = RemoveNetworkNamespace(context.Background(), t.Name())
 	if err != nil {
 		t.Fatalf("should not have failed to delete empty namepace got: %v", err)
 	}

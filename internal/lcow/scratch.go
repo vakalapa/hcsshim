@@ -1,3 +1,5 @@
+//go:build windows
+
 package lcow
 
 import (
@@ -30,7 +32,7 @@ const (
 // requested size. It has a caching capability. If the cacheFile exists, and the
 // request is for a default size, a copy of that is made to the target. If the
 // size is non-default, or the cache file does not exist, it uses a utility VM
-// to create target. It is the responsibility of the caller to synchronise
+// to create target. It is the responsibility of the caller to synchronize
 // simultaneous attempts to create the cache file.
 func CreateScratch(ctx context.Context, lcowUVM *uvm.UtilityVM, destFile string, sizeGB uint32, cacheFile string) error {
 	if lcowUVM == nil {
@@ -66,15 +68,12 @@ func CreateScratch(ctx context.Context, lcowUVM *uvm.UtilityVM, destFile string,
 		return fmt.Errorf("failed to create VHDx %s: %s", destFile, err)
 	}
 
-	var options []string
-	scsi, err := lcowUVM.AddSCSI(
+	scsi, err := lcowUVM.SCSIManager.AddVirtualDisk(
 		ctx,
 		destFile,
-		"", // No destination as not formatted
 		false,
-		lcowUVM.ScratchEncryptionEnabled(),
-		options,
-		uvm.VMAccessTypeIndividual,
+		lcowUVM.ID(),
+		nil, // Attach without mounting.
 	)
 	if err != nil {
 		return err
@@ -82,18 +81,18 @@ func CreateScratch(ctx context.Context, lcowUVM *uvm.UtilityVM, destFile string,
 	removeSCSI := true
 	defer func() {
 		if removeSCSI {
-			_ = lcowUVM.RemoveSCSI(ctx, destFile)
+			_ = scsi.Release(ctx)
 		}
 	}()
 
 	log.G(ctx).WithFields(logrus.Fields{
 		"dest":       destFile,
-		"controller": scsi.Controller,
-		"lun":        scsi.LUN,
+		"controller": scsi.Controller(),
+		"lun":        scsi.LUN(),
 	}).Debug("lcow::CreateScratch device attached")
 
 	// Validate /sys/bus/scsi/devices/C:0:0:L exists as a directory
-	devicePath := fmt.Sprintf("/sys/bus/scsi/devices/%d:0:0:%d/block", scsi.Controller, scsi.LUN)
+	devicePath := fmt.Sprintf("/sys/bus/scsi/devices/%d:0:0:%d/block", scsi.Controller(), scsi.LUN())
 	testdCtx, cancel := context.WithTimeout(ctx, timeout.TestDRetryLoop)
 	defer cancel()
 	for {
@@ -136,7 +135,7 @@ func CreateScratch(ctx context.Context, lcowUVM *uvm.UtilityVM, destFile string,
 
 	// Hot-Remove before we copy it
 	removeSCSI = false
-	if err := lcowUVM.RemoveSCSI(ctx, destFile); err != nil {
+	if err := scsi.Release(ctx); err != nil {
 		return fmt.Errorf("failed to hot-remove: %s", err)
 	}
 

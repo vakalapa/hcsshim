@@ -1,5 +1,5 @@
-// Package resources handles creating, updating, and releasing resources
-// on a container
+//go:build windows
+
 package resources
 
 import (
@@ -7,7 +7,6 @@ import (
 	"errors"
 
 	"github.com/Microsoft/hcsshim/internal/credentials"
-	"github.com/Microsoft/hcsshim/internal/layers"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 )
@@ -42,8 +41,16 @@ func (r *Resources) SetAddedNetNSToVM(addedNetNSToVM bool) {
 	r.addedNetNSToVM = addedNetNSToVM
 }
 
+func (r *Resources) SetLcowScratchPath(scratchPath string) {
+	r.lcowScratchPath = scratchPath
+}
+
+func (r *Resources) LcowScratchPath() string {
+	return r.lcowScratchPath
+}
+
 // SetLayers updates the container resource's image layers
-func (r *Resources) SetLayers(l *layers.ImageLayers) {
+func (r *Resources) SetLayers(l ResourceCloser) {
 	r.layers = l
 }
 
@@ -66,13 +73,19 @@ type Resources struct {
 	// For WCOW, this will be under wcowRootInUVM. For LCOW, this will be under
 	// lcowRootInUVM, this will also be the "OCI Bundle Path".
 	containerRootInUVM string
-	netNS              string
+	// lcowScratchPath represents the path inside the UVM at which the LCOW scratch
+	// directory is present.  Usually, this is the path at which the container scratch
+	// VHD is mounted inside the UVM (`containerRootInUVM`). But in case of scratch
+	// sharing this is a directory under the UVM scratch directory.
+	lcowScratchPath string
+
+	netNS string
 	// createNetNS indicates if the network namespace has been created
 	createdNetNS bool
 	// addedNetNSToVM indicates if the network namespace has been added to the containers utility VM
 	addedNetNSToVM bool
 	// layers is a pointer to a struct of the layers paths of a container
-	layers *layers.ImageLayers
+	layers ResourceCloser
 	// resources is a slice of the resources associated with a container
 	resources []ResourceCloser
 }
@@ -142,19 +155,8 @@ func ReleaseResources(ctx context.Context, r *Resources, vm *uvm.UtilityVM, all 
 		return errors.New("failed to release one or more container resources")
 	}
 
-	// cleanup container state
-	if vm != nil {
-		if vm.DeleteContainerStateSupported() {
-			if err := vm.DeleteContainerState(ctx, r.id); err != nil {
-				log.G(ctx).WithError(err).Error("failed to delete container state")
-			}
-		}
-	}
-
 	if r.layers != nil {
-		// TODO dcantah: Either make it so layers doesn't rely on the all bool for cleanup logic
-		// or find a way to factor out the all bool in favor of something else.
-		if err := r.layers.Release(ctx, all); err != nil {
+		if err := r.layers.Release(ctx); err != nil {
 			return err
 		}
 	}

@@ -1,3 +1,5 @@
+//go:build windows
+
 package jobobject
 
 import (
@@ -38,7 +40,7 @@ func pollIOCP(ctx context.Context, iocpHandle windows.Handle) {
 	)
 
 	for {
-		err := winapi.GetQueuedCompletionStatus(iocpHandle, &code, &key, (**windows.Overlapped)(unsafe.Pointer(&overlapped)), windows.INFINITE)
+		err := windows.GetQueuedCompletionStatus(iocpHandle, &code, &key, (**windows.Overlapped)(unsafe.Pointer(&overlapped)), windows.INFINITE)
 		if err != nil {
 			log.G(ctx).WithError(err).Error("failed to poll for job object message")
 			continue
@@ -57,7 +59,7 @@ func pollIOCP(ctx context.Context, iocpHandle windows.Handle) {
 				}).Warn("failed to parse job object message")
 				continue
 			}
-			if err := msq.Write(notification); err == queue.ErrQueueClosed {
+			if err := msq.Enqueue(notification); err == queue.ErrQueueClosed {
 				// Write will only return an error when the queue is closed.
 				// The only time a queue would ever be closed is when we call `Close` on
 				// the job it belongs to which also removes it from the jobMap, so something

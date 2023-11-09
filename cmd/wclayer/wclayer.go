@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -11,10 +13,7 @@ import (
 )
 
 // Add a manifest to get proper Windows version detection.
-//
-// goversioninfo can be installed with "go get github.com/josephspurrier/goversioninfo/cmd/goversioninfo"
-
-//go:generate goversioninfo -platform-specific
+//go:generate go run github.com/josephspurrier/goversioninfo/cmd/goversioninfo -platform-specific
 
 var usage = `Windows Container layer utility
 
@@ -32,6 +31,7 @@ func main() {
 		createCommand,
 		exportCommand,
 		importCommand,
+		makeBaseLayerCommand,
 		mountCommand,
 		removeCommand,
 		unmountCommand,

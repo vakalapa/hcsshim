@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package network
@@ -6,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +26,7 @@ var (
 	pciFindDeviceFullPath             = pci.FindDeviceFullPath
 	storageWaitForFileMatchingPattern = storage.WaitForFileMatchingPattern
 	vmbusWaitForDevicePath            = vmbus.WaitForDevicePath
-	ioutilReadDir                     = ioutil.ReadDir
+	ioReadDir                         = os.ReadDir
 )
 
 // maxDNSSearches is limited to 6 in `man 5 resolv.conf`
@@ -34,7 +34,7 @@ const maxDNSSearches = 6
 
 // GenerateEtcHostsContent generates a /etc/hosts file based on `hostname`.
 func GenerateEtcHostsContent(ctx context.Context, hostname string) string {
-	_, span := trace.StartSpan(ctx, "network::GenerateEtcHostsContent")
+	_, span := oc.StartSpan(ctx, "network::GenerateEtcHostsContent")
 	defer span.End()
 	span.AddAttributes(trace.StringAttribute("hostname", hostname))
 
@@ -59,7 +59,7 @@ func GenerateEtcHostsContent(ctx context.Context, hostname string) string {
 // GenerateResolvConfContent generates the resolv.conf file content based on
 // `searches`, `servers`, and `options`.
 func GenerateResolvConfContent(ctx context.Context, searches, servers, options []string) (_ string, err error) {
-	_, span := trace.StartSpan(ctx, "network::GenerateResolvConfContent")
+	_, span := oc.StartSpan(ctx, "network::GenerateResolvConfContent")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
@@ -115,16 +115,17 @@ func MergeValues(first, second []string) []string {
 //
 // Will retry the operation until `ctx` is exceeded or canceled.
 func InstanceIDToName(ctx context.Context, id string, vpciAssigned bool) (_ string, err error) {
-	ctx, span := trace.StartSpan(ctx, "network::InstanceIDToName")
+	ctx, span := oc.StartSpan(ctx, "network::InstanceIDToName")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
 	vmBusID := strings.ToLower(id)
 	span.AddAttributes(trace.StringAttribute("adapterInstanceID", vmBusID))
 
-	netDevicePath := ""
+	var netDevicePath string
 	if vpciAssigned {
-		pciDevicePath, err := pciFindDeviceFullPath(ctx, vmBusID)
+		var pciDevicePath string
+		pciDevicePath, err = pciFindDeviceFullPath(ctx, vmBusID)
 		if err != nil {
 			return "", err
 		}
@@ -138,9 +139,9 @@ func InstanceIDToName(ctx context.Context, id string, vpciAssigned bool) (_ stri
 		return "", errors.Wrapf(err, "failed to find adapter %v sysfs path", vmBusID)
 	}
 
-	var deviceDirs []os.FileInfo
+	var deviceDirs []os.DirEntry
 	for {
-		deviceDirs, err = ioutilReadDir(netDevicePath)
+		deviceDirs, err = ioReadDir(netDevicePath)
 		if err != nil {
 			if os.IsNotExist(err) {
 				select {

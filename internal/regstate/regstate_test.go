@@ -1,3 +1,5 @@
+//go:build windows
+
 package regstate
 
 import (
@@ -8,6 +10,7 @@ import (
 var testKey = "runhcs-test-test-key"
 
 func prepTest(t *testing.T) {
+	t.Helper()
 	err := RemoveAll(testKey, true)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)

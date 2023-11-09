@@ -1,3 +1,5 @@
+//go:build windows
+
 package uvm
 
 import (
@@ -5,22 +7,26 @@ import (
 	"strings"
 
 	"github.com/Microsoft/go-winio"
-	"github.com/Microsoft/hcsshim/hcn"
-	"github.com/Microsoft/hcsshim/internal/computeagent"
-	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
-	"github.com/Microsoft/hcsshim/internal/hns"
-	"github.com/Microsoft/hcsshim/pkg/octtrpc"
 	"github.com/containerd/ttrpc"
-	"github.com/containerd/typeurl"
+	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Microsoft/hcsshim/hcn"
+	"github.com/Microsoft/hcsshim/internal/computeagent"
+	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	"github.com/Microsoft/hcsshim/internal/hns"
 	"github.com/Microsoft/hcsshim/internal/log"
+	ncproxynetworking "github.com/Microsoft/hcsshim/internal/ncproxy/networking"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
+	"github.com/Microsoft/hcsshim/pkg/octtrpc"
 )
 
 func init() {
+	typeurl.Register(&ncproxynetworking.Endpoint{}, "ncproxy/ncproxynetworking/Endpoint")
+	typeurl.Register(&ncproxynetworking.Network{}, "ncproxy/ncproxynetworking/Network")
 	typeurl.Register(&hcn.HostComputeEndpoint{}, "ncproxy/hcn/HostComputeEndpoint")
 	typeurl.Register(&hcn.HostComputeNetwork{}, "ncproxy/hcn/HostComputeNetwork")
 }
@@ -35,8 +41,10 @@ type agentComputeSystem interface {
 	AddEndpointToNSWithID(context.Context, string, string, *hns.HNSEndpoint) error
 	UpdateNIC(context.Context, string, *hcsschema.NetworkAdapter) error
 	RemoveEndpointFromNS(context.Context, string, *hns.HNSEndpoint) error
-	AssignDevice(context.Context, string, uint16) (*VPCIDevice, error)
+	AssignDevice(context.Context, string, uint16, string) (*VPCIDevice, error)
 	RemoveDevice(context.Context, string, uint16) error
+	AddNICInGuest(context.Context, *guestresource.LCOWNetworkAdapter) error
+	RemoveNICInGuest(context.Context, *guestresource.LCOWNetworkAdapter) error
 }
 
 var _ agentComputeSystem = &UtilityVM{}
@@ -63,7 +71,7 @@ func (ca *computeAgent) AssignPCI(ctx context.Context, req *computeagent.AssignP
 		return nil, status.Error(codes.InvalidArgument, "received empty field in request")
 	}
 
-	dev, err := ca.uvm.AssignDevice(ctx, req.DeviceID, uint16(req.VirtualFunctionIndex))
+	dev, err := ca.uvm.AssignDevice(ctx, req.DeviceID, uint16(req.VirtualFunctionIndex), req.NicID)
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +111,18 @@ func (ca *computeAgent) AddNIC(ctx context.Context, req *computeagent.AddNICInte
 	}
 
 	switch endpt := endpoint.(type) {
+	case *ncproxynetworking.Endpoint:
+		cfg := &guestresource.LCOWNetworkAdapter{
+			NamespaceID:    endpt.NamespaceID,
+			ID:             req.NicID,
+			IPAddress:      endpt.Settings.IPAddress,
+			PrefixLength:   uint8(endpt.Settings.IPAddressPrefixLength),
+			GatewayAddress: endpt.Settings.DefaultGateway,
+			VPCIAssigned:   true,
+		}
+		if err := ca.uvm.AddNICInGuest(ctx, cfg); err != nil {
+			return nil, err
+		}
 	case *hcn.HostComputeEndpoint:
 		hnsEndpoint, err := hnsGetHNSEndpointByName(endpt.Name)
 		if err != nil {
@@ -135,6 +155,8 @@ func (ca *computeAgent) ModifyNIC(ctx context.Context, req *computeagent.ModifyN
 	}
 
 	switch endpt := endpoint.(type) {
+	case *ncproxynetworking.Endpoint:
+		return nil, errors.New("modifying ncproxy networking endpoints is not supported")
 	case *hcn.HostComputeEndpoint:
 		hnsEndpoint, err := hnsGetHNSEndpointByName(endpt.Name)
 		if err != nil {
@@ -184,6 +206,13 @@ func (ca *computeAgent) DeleteNIC(ctx context.Context, req *computeagent.DeleteN
 	}
 
 	switch endpt := endpoint.(type) {
+	case *ncproxynetworking.Endpoint:
+		cfg := &guestresource.LCOWNetworkAdapter{
+			ID: req.NicID,
+		}
+		if err := ca.uvm.RemoveNICInGuest(ctx, cfg); err != nil {
+			return nil, err
+		}
 	case *hcn.HostComputeEndpoint:
 		hnsEndpoint, err := hnsGetHNSEndpointByName(endpt.Name)
 		if err != nil {

@@ -1,4 +1,5 @@
-// +build integration
+//go:build windows && integration
+// +build windows,integration
 
 package hcn
 
@@ -361,5 +362,4 @@ func TestApplyTierAclPolicyOnEndpoint(t *testing.T) {
 	if len(foundEndpoint.Policies) == 0 {
 		t.Fatal("No Endpoint Policies found")
 	}
-
 }

@@ -1,8 +1,9 @@
+//go:build windows
+
 package uvm
 
-// This package describes the external interface for utility VMs.
-
 import (
+	"io"
 	"net"
 	"sync"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/hcs"
 	"github.com/Microsoft/hcsshim/internal/hcs/schema1"
 	"github.com/Microsoft/hcsshim/internal/hns"
+	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
 )
 
 //                    | WCOW | LCOW
@@ -60,6 +62,13 @@ type UtilityVM struct {
 	// NOTE: All accesses to this MUST be done atomically.
 	containerCounter uint64
 
+	// noWritableFileShares disables mounting any writable vSMB or Plan9 shares
+	// on the uVM. This prevents containers in the uVM modifying files and directories
+	// made available via the "mounts" options in the container spec, or shared
+	// to the uVM directly.
+	// This option does not prevent writable SCSI mounts.
+	noWritableFileShares bool
+
 	// VSMB shares that are mapped into a Windows UVM. These are used for read-only
 	// layers and mapped directories.
 	// We maintain two sets of maps, `vsmbDirShares` tracks shares that are
@@ -80,11 +89,12 @@ type UtilityVM struct {
 	vpmemDevicesMultiMapped [MaxVPMEMCount]*vPMemInfoMulti
 
 	// SCSI devices that are mapped into a Windows or Linux utility VM
-	scsiLocations       [4][64]*SCSIMount // Hyper-V supports 4 controllers, 64 slots per controller. Limited to 1 controller for now though.
-	scsiControllerCount uint32            // Number of SCSI controllers in the utility VM
-	encryptScratch      bool              // Enable scratch encryption
+	SCSIManager         *scsi.Manager
+	scsiControllerCount uint32 // Number of SCSI controllers in the utility VM
+	reservedSCSISlots   []scsi.Slot
 
-	vpciDevices map[VPCIDeviceKey]*VPCIDevice // map of device instance id to vpci device
+	encryptScratch bool                          // Enable scratch encryption
+	vpciDevices    map[VPCIDeviceKey]*VPCIDevice // map of device instance id to vpci device
 
 	// Plan9 are directories mapped into a Linux utility VM
 	plan9Counter uint64 // Each newly-added plan9 share has a counter used as its ID in the ResourceURI and for the name
@@ -111,16 +121,6 @@ type UtilityVM struct {
 	// Access to this variable should be done atomically.
 	mountCounter uint64
 
-	// specifies if this UVM is created to be saved as a template
-	IsTemplate bool
-
-	// specifies if this UVM is a cloned from a template
-	IsClone bool
-
-	// ID of the template from which this clone was created. Only applies when IsClone
-	// is true
-	TemplateID string
-
 	// Location that container process dumps will get written too.
 	processDumpLocation string
 
@@ -139,4 +139,16 @@ type UtilityVM struct {
 	// noInheritHostTimezone specifies whether to not inherit the hosts timezone for the UVM. UTC will be set as the default instead.
 	// This only applies for WCOW.
 	noInheritHostTimezone bool
+
+	// confidentialUVMOptions hold confidential UVM specific options
+	confidentialUVMOptions *ConfidentialOptions
 }
+
+func (uvm *UtilityVM) ScratchEncryptionEnabled() bool {
+	return uvm.encryptScratch
+}
+
+// OutputHandler is used to process the output from the program run in the UVM.
+type OutputHandler func(io.Reader)
+
+type OutputHandlerCreator func(*Options) OutputHandler

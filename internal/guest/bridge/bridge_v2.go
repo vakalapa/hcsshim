@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package bridge
@@ -8,7 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Microsoft/hcsshim/internal/debug"
+	"github.com/pkg/errors"
+	"go.opencensus.io/trace"
+	"golang.org/x/sys/unix"
+
 	"github.com/Microsoft/hcsshim/internal/guest/commonutils"
 	"github.com/Microsoft/hcsshim/internal/guest/gcserr"
 	"github.com/Microsoft/hcsshim/internal/guest/prot"
@@ -16,9 +20,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/guest/stdio"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/oc"
-	"github.com/pkg/errors"
-	"go.opencensus.io/trace"
-	"golang.org/x/sys/unix"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
 )
 
 // The capabilities of this GCS.
@@ -44,7 +46,7 @@ var capabilities = prot.GcsCapabilities{
 // negotiateProtocolV2 was introduced in v4 so will not be called with a minimum
 // lower than that.
 func (b *Bridge) negotiateProtocolV2(r *Request) (_ RequestResponse, err error) {
-	_, span := trace.StartSpan(r.Context, "opengcs::bridge::negotiateProtocolV2")
+	_, span := oc.StartSpan(r.Context, "opengcs::bridge::negotiateProtocolV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
@@ -80,7 +82,7 @@ func (b *Bridge) negotiateProtocolV2(r *Request) (_ RequestResponse, err error) 
 //
 // This is allowed only for protocol version 4+, schema version 2.1+
 func (b *Bridge) createContainerV2(r *Request) (_ RequestResponse, err error) {
-	ctx, span := trace.StartSpan(r.Context, "opengcs::bridge::createContainerV2")
+	ctx, span := oc.StartSpan(r.Context, "opengcs::bridge::createContainerV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
@@ -133,7 +135,7 @@ func (b *Bridge) createContainerV2(r *Request) (_ RequestResponse, err error) {
 //
 // This is allowed only for protocol version 4+, schema version 2.1+
 func (b *Bridge) startContainerV2(r *Request) (_ RequestResponse, err error) {
-	_, span := trace.StartSpan(r.Context, "opengcs::bridge::startContainerV2")
+	_, span := oc.StartSpan(r.Context, "opengcs::bridge::startContainerV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
@@ -164,7 +166,7 @@ func (b *Bridge) startContainerV2(r *Request) (_ RequestResponse, err error) {
 //
 // This is allowed only for protocol version 4+, schema version 2.1+
 func (b *Bridge) execProcessV2(r *Request) (_ RequestResponse, err error) {
-	ctx, span := trace.StartSpan(r.Context, "opengcs::bridge::execProcessV2")
+	ctx, span := oc.StartSpan(r.Context, "opengcs::bridge::execProcessV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
@@ -192,18 +194,7 @@ func (b *Bridge) execProcessV2(r *Request) (_ RequestResponse, err error) {
 		conSettings.StdErr = &request.Settings.VsockStdioRelaySettings.StdErr
 	}
 
-	var pid int
-	var c *hcsv2.Container
-	if params.IsExternal || request.ContainerID == hcsv2.UVMContainerID {
-		pid, err = b.hostState.RunExternalProcess(ctx, params, conSettings)
-	} else if c, err = b.hostState.GetContainer(request.ContainerID); err == nil {
-		// We found a V2 container. Treat this as a V2 process.
-		if params.OCIProcess == nil {
-			pid, err = c.Start(ctx, conSettings)
-		} else {
-			pid, err = c.ExecProcess(ctx, params.OCIProcess, conSettings)
-		}
-	}
+	pid, err := b.hostState.ExecProcess(ctx, request.ContainerID, params, conSettings)
 
 	if err != nil {
 		return nil, err
@@ -220,11 +211,11 @@ func (b *Bridge) execProcessV2(r *Request) (_ RequestResponse, err error) {
 //
 // This is allowed only for protocol version 4+, schema version 2.1+
 func (b *Bridge) killContainerV2(r *Request) (RequestResponse, error) {
-	ctx, span := trace.StartSpan(r.Context, "opengcs::bridge::killContainerV2")
+	ctx, span := oc.StartSpan(r.Context, "opengcs::bridge::killContainerV2")
 	defer span.End()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
 
-	return b.signalContainerV2(ctx, span, r, unix.SIGKILL)
+	return b.signalContainerShutdownV2(ctx, span, r, false)
 }
 
 // shutdownContainerV2 is a user requested shutdown of the container and all
@@ -233,21 +224,22 @@ func (b *Bridge) killContainerV2(r *Request) (RequestResponse, error) {
 //
 // This is allowed only for protocol version 4+, schema version 2.1+
 func (b *Bridge) shutdownContainerV2(r *Request) (RequestResponse, error) {
-	ctx, span := trace.StartSpan(r.Context, "opengcs::bridge::shutdownContainerV2")
+	ctx, span := oc.StartSpan(r.Context, "opengcs::bridge::shutdownContainerV2")
 	defer span.End()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
 
-	return b.signalContainerV2(ctx, span, r, unix.SIGTERM)
+	return b.signalContainerShutdownV2(ctx, span, r, true)
 }
 
-// signalContainerV2 is not a handler func. This is because the actual signal is
-// implied based on the message type of either `killContainerV2` or
-// `shutdownContainerV2`.
-func (b *Bridge) signalContainerV2(ctx context.Context, span *trace.Span, r *Request, signal syscall.Signal) (_ RequestResponse, err error) {
+// signalContainerV2 is not a handler func. It is called from either
+// `killContainerV2` or `shutdownContainerV2` to deliver a SIGTERM or SIGKILL
+// respectively
+func (b *Bridge) signalContainerShutdownV2(ctx context.Context, span *trace.Span, r *Request, graceful bool) (_ RequestResponse, err error) {
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(
 		trace.StringAttribute("cid", r.ContainerID),
-		trace.Int64Attribute("signal", int64(signal)))
+		trace.BoolAttribute("graceful", graceful),
+	)
 
 	var request prot.MessageBase
 	if err := commonutils.UnmarshalJSONWithHresult(r.Message, &request); err != nil {
@@ -257,19 +249,11 @@ func (b *Bridge) signalContainerV2(ctx context.Context, span *trace.Span, r *Req
 	// If this is targeting the UVM send the request to the host itself.
 	if request.ContainerID == hcsv2.UVMContainerID {
 		// We are asking to shutdown the UVM itself.
-		if signal != unix.SIGTERM {
-			log.G(ctx).Error("invalid signal for uvm")
-		}
 		// This is a destructive call. We do not respond to the HCS
 		b.quitChan <- true
 		b.hostState.Shutdown()
 	} else {
-		c, err := b.hostState.GetContainer(request.ContainerID)
-		if err != nil {
-			return nil, err
-		}
-
-		err = c.Kill(ctx, signal)
+		err = b.hostState.ShutdownContainer(ctx, request.ContainerID, graceful)
 		if err != nil {
 			return nil, err
 		}
@@ -279,7 +263,7 @@ func (b *Bridge) signalContainerV2(ctx context.Context, span *trace.Span, r *Req
 }
 
 func (b *Bridge) signalProcessV2(r *Request) (_ RequestResponse, err error) {
-	ctx, span := trace.StartSpan(r.Context, "opengcs::bridge::signalProcessV2")
+	ctx, span := oc.StartSpan(r.Context, "opengcs::bridge::signalProcessV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
@@ -293,23 +277,14 @@ func (b *Bridge) signalProcessV2(r *Request) (_ RequestResponse, err error) {
 		trace.Int64Attribute("pid", int64(request.ProcessID)),
 		trace.Int64Attribute("signal", int64(request.Options.Signal)))
 
-	c, err := b.hostState.GetContainer(request.ContainerID)
-	if err != nil {
-		return nil, err
-	}
-
-	p, err := c.GetProcess(request.ProcessID)
-	if err != nil {
-		return nil, err
-	}
-
 	var signal syscall.Signal
 	if request.Options.Signal == 0 {
 		signal = unix.SIGKILL
 	} else {
 		signal = syscall.Signal(request.Options.Signal)
 	}
-	if err := p.Kill(ctx, signal); err != nil {
+
+	if err := b.hostState.SignalContainerProcess(ctx, request.ContainerID, request.ProcessID, signal); err != nil {
 		return nil, err
 	}
 
@@ -317,7 +292,7 @@ func (b *Bridge) signalProcessV2(r *Request) (_ RequestResponse, err error) {
 }
 
 func (b *Bridge) getPropertiesV2(r *Request) (_ RequestResponse, err error) {
-	ctx, span := trace.StartSpan(r.Context, "opengcs::bridge::getPropertiesV2")
+	ctx, span := oc.StartSpan(r.Context, "opengcs::bridge::getPropertiesV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
@@ -326,8 +301,6 @@ func (b *Bridge) getPropertiesV2(r *Request) (_ RequestResponse, err error) {
 	if err := commonutils.UnmarshalJSONWithHresult(r.Message, &request); err != nil {
 		return nil, errors.Wrapf(err, "failed to unmarshal JSON in message \"%s\"", r.Message)
 	}
-
-	properties := &prot.PropertiesV2{}
 
 	var query prot.PropertyQuery
 	if len(request.Query) != 0 {
@@ -341,28 +314,9 @@ func (b *Bridge) getPropertiesV2(r *Request) (_ RequestResponse, err error) {
 		return nil, errors.New("getPropertiesV2 is not supported against the UVM")
 	}
 
-	c, err := b.hostState.GetContainer(request.ContainerID)
+	properties, err := b.hostState.GetProperties(ctx, request.ContainerID, query)
 	if err != nil {
 		return nil, err
-	}
-
-	for _, requestedProperty := range query.PropertyTypes {
-		if requestedProperty == prot.PtProcessList {
-			pids, err := c.GetAllProcessPids(ctx)
-			if err != nil {
-				return nil, err
-			}
-			properties.ProcessList = make([]prot.ProcessDetails, len(pids))
-			for i, pid := range pids {
-				properties.ProcessList[i].ProcessID = uint32(pid)
-			}
-		} else if requestedProperty == prot.PtStatistics {
-			cgroupMetrics, err := c.GetStats(ctx)
-			if err != nil {
-				return nil, err
-			}
-			properties.Metrics = cgroupMetrics
-		}
 	}
 
 	propertyJSON := []byte("{}")
@@ -380,7 +334,7 @@ func (b *Bridge) getPropertiesV2(r *Request) (_ RequestResponse, err error) {
 }
 
 func (b *Bridge) waitOnProcessV2(r *Request) (_ RequestResponse, err error) {
-	_, span := trace.StartSpan(r.Context, "opengcs::bridge::waitOnProcessV2")
+	_, span := oc.StartSpan(r.Context, "opengcs::bridge::waitOnProcessV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
@@ -404,7 +358,7 @@ func (b *Bridge) waitOnProcessV2(r *Request) (_ RequestResponse, err error) {
 		}
 		exitCodeChan, doneChan = p.Wait()
 	} else {
-		c, err := b.hostState.GetContainer(request.ContainerID)
+		c, err := b.hostState.GetCreatedContainer(request.ContainerID)
 		if err != nil {
 			return nil, err
 		}
@@ -435,7 +389,7 @@ func (b *Bridge) waitOnProcessV2(r *Request) (_ RequestResponse, err error) {
 }
 
 func (b *Bridge) resizeConsoleV2(r *Request) (_ RequestResponse, err error) {
-	ctx, span := trace.StartSpan(r.Context, "opengcs::bridge::resizeConsoleV2")
+	ctx, span := oc.StartSpan(r.Context, "opengcs::bridge::resizeConsoleV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
@@ -450,7 +404,7 @@ func (b *Bridge) resizeConsoleV2(r *Request) (_ RequestResponse, err error) {
 		trace.Int64Attribute("height", int64(request.Height)),
 		trace.Int64Attribute("width", int64(request.Width)))
 
-	c, err := b.hostState.GetContainer(request.ContainerID)
+	c, err := b.hostState.GetCreatedContainer(request.ContainerID)
 	if err != nil {
 		return nil, err
 	}
@@ -469,7 +423,7 @@ func (b *Bridge) resizeConsoleV2(r *Request) (_ RequestResponse, err error) {
 }
 
 func (b *Bridge) modifySettingsV2(r *Request) (_ RequestResponse, err error) {
-	ctx, span := trace.StartSpan(r.Context, "opengcs::bridge::modifySettingsV2")
+	ctx, span := oc.StartSpan(r.Context, "opengcs::bridge::modifySettingsV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute("cid", r.ContainerID))
@@ -479,7 +433,7 @@ func (b *Bridge) modifySettingsV2(r *Request) (_ RequestResponse, err error) {
 		return nil, errors.Wrapf(err, "failed to unmarshal JSON in message \"%s\"", r.Message)
 	}
 
-	err = b.hostState.ModifySettings(ctx, request.ContainerID, request.Request.(*prot.ModifySettingRequest))
+	err = b.hostState.ModifySettings(ctx, request.ContainerID, request.Request.(*guestrequest.ModificationRequest))
 	if err != nil {
 		return nil, err
 	}
@@ -488,19 +442,21 @@ func (b *Bridge) modifySettingsV2(r *Request) (_ RequestResponse, err error) {
 }
 
 func (b *Bridge) dumpStacksV2(r *Request) (_ RequestResponse, err error) {
-	_, span := trace.StartSpan(r.Context, "opengcs::bridge::dumpStacksV2")
+	ctx, span := oc.StartSpan(r.Context, "opengcs::bridge::dumpStacksV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
-	stacks := debug.DumpStacks()
-
+	stacks, err := b.hostState.GetStacks(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return &prot.DumpStacksResponse{
 		GuestStacks: stacks,
 	}, nil
 }
 
 func (b *Bridge) deleteContainerStateV2(r *Request) (_ RequestResponse, err error) {
-	ctx, span := trace.StartSpan(r.Context, "opengcs::bridge::deleteContainerStateV2")
+	ctx, span := oc.StartSpan(r.Context, "opengcs::bridge::deleteContainerStateV2")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
@@ -511,15 +467,16 @@ func (b *Bridge) deleteContainerStateV2(r *Request) (_ RequestResponse, err erro
 		return nil, errors.Wrapf(err, "failed to unmarshal JSON in message \"%s\"", r.Message)
 	}
 
-	c, err := b.hostState.GetContainer(request.ContainerID)
+	c, err := b.hostState.GetCreatedContainer(request.ContainerID)
 	if err != nil {
 		return nil, err
 	}
+	// remove container state regardless of delete's success
+	defer b.hostState.RemoveContainer(request.ContainerID)
 
 	if err := c.Delete(ctx); err != nil {
 		return nil, err
 	}
 
-	b.hostState.RemoveContainer(request.ContainerID)
 	return &prot.MessageResponseBase{}, nil
 }

@@ -3,28 +3,26 @@ package tar2ext4
 import (
 	"archive/tar"
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
-	"unsafe"
-
-	"github.com/pkg/errors"
 
 	"github.com/Microsoft/hcsshim/ext4/dmverity"
 	"github.com/Microsoft/hcsshim/ext4/internal/compactext4"
 	"github.com/Microsoft/hcsshim/ext4/internal/format"
+	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/pkg/errors"
 )
 
 type params struct {
-	convertWhiteout bool
-	appendVhdFooter bool
-	appendDMVerity  bool
-	ext4opts        []compactext4.Option
+	convertWhiteout  bool
+	convertBackslash bool
+	appendVhdFooter  bool
+	appendDMVerity   bool
+	ext4opts         []compactext4.Option
 }
 
 // Option is the type for optional parameters to Convert.
@@ -36,13 +34,19 @@ func ConvertWhiteout(p *params) {
 	p.convertWhiteout = true
 }
 
+// ConvertBackslash instructs the converter to replace `\` in path names with `/`.
+// This is useful if the tar file was created on Windows, where `\` is the filepath separator.
+func ConvertBackslash(p *params) {
+	p.convertBackslash = true
+}
+
 // AppendVhdFooter instructs the converter to add a fixed VHD footer to the
 // file.
 func AppendVhdFooter(p *params) {
 	p.appendVhdFooter = true
 }
 
-// AppendDMVerity instructs the converter to add a dmverity merkle tree for
+// AppendDMVerity instructs the converter to add a dmverity Merkle tree for
 // the ext4 filesystem after the filesystem and before the optional VHD footer
 func AppendDMVerity(p *params) {
 	p.appendDMVerity = true
@@ -67,7 +71,6 @@ func MaximumDiskSize(size int64) Option {
 const (
 	whiteoutPrefix = ".wh."
 	opaqueWhiteout = ".wh..wh..opq"
-	ext4BlockSize  = compactext4.BlockSize
 )
 
 // ConvertTarToExt4 writes a compact ext4 file system image that contains the files in the
@@ -89,23 +92,32 @@ func ConvertTarToExt4(r io.Reader, w io.ReadWriteSeeker, options ...Option) erro
 			return err
 		}
 
-		if err = fs.MakeParents(hdr.Name); err != nil {
-			return errors.Wrapf(err, "failed to ensure parent directories for %s", hdr.Name)
+		name := hdr.Name
+		linkName := hdr.Linkname
+		if p.convertBackslash {
+			// compactext assumes all paths are `/` separated
+			// unconditionally replace all instances of `/`, regardless of GOOS
+			name = strings.ReplaceAll(name, `\`, "/")
+			linkName = strings.ReplaceAll(linkName, `\`, "/")
+		}
+
+		if err = fs.MakeParents(name); err != nil {
+			return errors.Wrapf(err, "failed to ensure parent directories for %s", name)
 		}
 
 		if p.convertWhiteout {
-			dir, name := path.Split(hdr.Name)
-			if strings.HasPrefix(name, whiteoutPrefix) {
-				if name == opaqueWhiteout {
+			dir, file := path.Split(name)
+			if strings.HasPrefix(file, whiteoutPrefix) {
+				if file == opaqueWhiteout {
 					// Update the directory with the appropriate xattr.
 					f, err := fs.Stat(dir)
 					if err != nil {
-						return errors.Wrapf(err, "failed to stat parent directory of whiteout %s", hdr.Name)
+						return errors.Wrapf(err, "failed to stat parent directory of whiteout %s", file)
 					}
 					f.Xattrs["trusted.overlay.opaque"] = []byte("y")
 					err = fs.Create(dir, f)
 					if err != nil {
-						return errors.Wrapf(err, "failed to create opaque dir %s", hdr.Name)
+						return errors.Wrapf(err, "failed to create opaque dir %s", file)
 					}
 				} else {
 					// Create an overlay-style whiteout.
@@ -114,9 +126,9 @@ func ConvertTarToExt4(r io.Reader, w io.ReadWriteSeeker, options ...Option) erro
 						Devmajor: 0,
 						Devminor: 0,
 					}
-					err = fs.Create(path.Join(dir, name[len(whiteoutPrefix):]), f)
+					err = fs.Create(path.Join(dir, file[len(whiteoutPrefix):]), f)
 					if err != nil {
-						return errors.Wrapf(err, "failed to create whiteout file for %s", hdr.Name)
+						return errors.Wrapf(err, "failed to create whiteout file for %s", file)
 					}
 				}
 
@@ -125,7 +137,7 @@ func ConvertTarToExt4(r io.Reader, w io.ReadWriteSeeker, options ...Option) erro
 		}
 
 		if hdr.Typeflag == tar.TypeLink {
-			err = fs.Link(hdr.Linkname, hdr.Name)
+			err = fs.Link(linkName, name)
 			if err != nil {
 				return err
 			}
@@ -139,7 +151,7 @@ func ConvertTarToExt4(r io.Reader, w io.ReadWriteSeeker, options ...Option) erro
 				Size:     hdr.Size,
 				Uid:      uint32(hdr.Uid),
 				Gid:      uint32(hdr.Gid),
-				Linkname: hdr.Linkname,
+				Linkname: linkName,
 				Devmajor: uint32(hdr.Devmajor),
 				Devminor: uint32(hdr.Devminor),
 				Xattrs:   make(map[string][]byte),
@@ -153,7 +165,7 @@ func ConvertTarToExt4(r io.Reader, w io.ReadWriteSeeker, options ...Option) erro
 
 			var typ uint16
 			switch hdr.Typeflag {
-			case tar.TypeReg, tar.TypeRegA:
+			case tar.TypeReg:
 				typ = compactext4.S_IFREG
 			case tar.TypeSymlink:
 				typ = compactext4.S_IFLNK
@@ -168,7 +180,7 @@ func ConvertTarToExt4(r io.Reader, w io.ReadWriteSeeker, options ...Option) erro
 			}
 			f.Mode &= ^compactext4.TypeMask
 			f.Mode |= typ
-			err = fs.Create(hdr.Name, f)
+			err = fs.Create(name, f)
 			if err != nil {
 				return err
 			}
@@ -194,55 +206,30 @@ func Convert(r io.Reader, w io.ReadWriteSeeker, options ...Option) error {
 	}
 
 	if p.appendDMVerity {
-		// Rewind the stream for dm-verity processing
-		if _, err := w.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-
-		merkleTree, err := dmverity.MerkleTree(bufio.NewReaderSize(w, dmverity.MerkleTreeBufioSize))
-		if err != nil {
-			return errors.Wrap(err, "failed to build merkle tree")
-		}
-
-		// Write dm-verity super-block and then the merkle tree after the end of the
-		// ext4 filesystem
-		ext4size, err := w.Seek(0, io.SeekEnd)
-		if err != nil {
-			return err
-		}
-
-		superBlock := dmverity.NewDMVeritySuperblock(uint64(ext4size))
-		if err = binary.Write(w, binary.LittleEndian, superBlock); err != nil {
-			return err
-		}
-
-		// pad the super-block
-		sbsize := int(unsafe.Sizeof(*superBlock))
-		padding := bytes.Repeat([]byte{0}, ext4BlockSize-(sbsize%ext4BlockSize))
-		if _, err = w.Write(padding); err != nil {
-			return err
-		}
-
-		// write the tree
-		if _, err = w.Write(merkleTree); err != nil {
+		if err := dmverity.ComputeAndWriteHashDevice(w, w); err != nil {
 			return err
 		}
 	}
 
 	if p.appendVhdFooter {
-		size, err := w.Seek(0, io.SeekEnd)
-		if err != nil {
-			return err
-		}
-		err = binary.Write(w, binary.BigEndian, makeFixedVHDFooter(size))
-		if err != nil {
-			return err
-		}
+		return ConvertToVhd(w)
 	}
 	return nil
 }
 
-// ReadExt4SuperBlock reads and returns ext4 super block from VHD
+// ReadExt4SuperBlock reads and returns ext4 super block from given device.
+func ReadExt4SuperBlock(devicePath string) (*format.SuperBlock, error) {
+	dev, err := os.OpenFile(devicePath, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dev.Close()
+
+	return ReadExt4SuperBlockReadSeeker(dev)
+}
+
+// ReadExt4SuperBlockReadSeeker reads and returns ext4 super block given
+// an io.ReadSeeker.
 //
 // The layout on disk is as follows:
 // | Group 0 padding     | - 1024 bytes
@@ -257,26 +244,54 @@ func Convert(r io.Reader, w io.ReadWriteSeeker, options ...Option) error {
 // More details can be found here https://ext4.wiki.kernel.org/index.php/Ext4_Disk_Layout
 //
 // Our goal is to skip the Group 0 padding, read and return the ext4 SuperBlock
-func ReadExt4SuperBlock(vhdPath string) (*format.SuperBlock, error) {
-	vhd, err := os.OpenFile(vhdPath, os.O_RDONLY, 0)
+func ReadExt4SuperBlockReadSeeker(rsc io.ReadSeeker) (*format.SuperBlock, error) {
+	// save current reader position
+	currBytePos, err := rsc.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return nil, err
 	}
-	defer vhd.Close()
 
-	// Skip padding at the start
-	if _, err := vhd.Seek(1024, io.SeekStart); err != nil {
+	if _, err := rsc.Seek(1024, io.SeekCurrent); err != nil {
 		return nil, err
 	}
 	var sb format.SuperBlock
-	if err := binary.Read(vhd, binary.LittleEndian, &sb); err != nil {
+	if err := binary.Read(rsc, binary.LittleEndian, &sb); err != nil {
 		return nil, err
 	}
-	// Make sure the magic bytes are correct.
+
+	// reset the reader to initial position
+	if _, err := rsc.Seek(currBytePos, io.SeekStart); err != nil {
+		return nil, err
+	}
+
 	if sb.Magic != format.SuperBlockMagic {
 		return nil, errors.New("not an ext4 file system")
 	}
 	return &sb, nil
+}
+
+// IsDeviceExt4 is will read the device's superblock and determine if it is
+// and ext4 superblock.
+func IsDeviceExt4(devicePath string) bool {
+	// ReadExt4SuperBlock will check the superblock magic number for us,
+	// so we know if no error is returned, this is an ext4 device.
+	_, err := ReadExt4SuperBlock(devicePath)
+	if err != nil {
+		log.L.Warnf("failed to read Ext4 superblock: %s", err)
+	}
+	return err == nil
+}
+
+// Ext4FileSystemSize reads ext4 superblock and returns the size of the underlying
+// ext4 file system and its block size.
+func Ext4FileSystemSize(r io.ReadSeeker) (int64, int, error) {
+	sb, err := ReadExt4SuperBlockReadSeeker(r)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to read ext4 superblock: %w", err)
+	}
+	blockSize := 1024 * (1 << sb.LogBlockSize)
+	fsSize := int64(blockSize) * int64(sb.BlocksCountLow)
+	return fsSize, blockSize, nil
 }
 
 // ConvertAndComputeRootDigest writes a compact ext4 file system image that contains the files in the
@@ -284,13 +299,14 @@ func ReadExt4SuperBlock(vhdPath string) (*format.SuperBlock, error) {
 // merkle tree root digest. Convert is called with minimal options: ConvertWhiteout and MaximumDiskSize
 // set to dmverity.RecommendedVHDSizeGB.
 func ConvertAndComputeRootDigest(r io.Reader) (string, error) {
-	out, err := ioutil.TempFile("", "")
+	out, err := os.CreateTemp("", "")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temporary file: %s", err)
 	}
 	defer func() {
 		_ = os.Remove(out.Name())
 	}()
+	defer out.Close()
 
 	options := []Option{
 		ConvertWhiteout,
@@ -311,4 +327,13 @@ func ConvertAndComputeRootDigest(r io.Reader) (string, error) {
 
 	hash := dmverity.RootHash(tree)
 	return fmt.Sprintf("%x", hash), nil
+}
+
+// ConvertToVhd converts given io.WriteSeeker to VHD, by appending the VHD footer with a fixed size.
+func ConvertToVhd(w io.WriteSeeker) error {
+	size, err := w.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	return binary.Write(w, binary.BigEndian, makeFixedVHDFooter(size))
 }

@@ -1,16 +1,23 @@
+//go:build windows
+
 package main
 
 import (
+	"context"
+	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/stats"
-	v1 "github.com/containerd/cgroups/stats/v1"
+	v1 "github.com/containerd/cgroups/v3/cgroup1/stats"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/pkg/errors"
 )
 
 func verifyExpectedError(t *testing.T, resp interface{}, actual, expected error) {
-	if actual == nil || errors.Cause(actual) != expected {
+	t.Helper()
+	if actual == nil || errors.Cause(actual) != expected || !errors.Is(actual, expected) {
 		t.Fatalf("expected error: %v, got: %v", expected, actual)
 	}
 
@@ -27,6 +34,7 @@ func verifyExpectedError(t *testing.T, resp interface{}, actual, expected error)
 }
 
 func verifyExpectedStats(t *testing.T, isWCOW, ownsHost bool, s *stats.Statistics) {
+	t.Helper()
 	if isWCOW {
 		verifyExpectedWindowsContainerStatistics(t, s.GetWindows())
 	} else {
@@ -38,6 +46,7 @@ func verifyExpectedStats(t *testing.T, isWCOW, ownsHost bool, s *stats.Statistic
 }
 
 func verifyExpectedWindowsContainerStatistics(t *testing.T, w *stats.WindowsContainerStatistics) {
+	t.Helper()
 	if w == nil {
 		t.Fatal("expected non-nil WindowsContainerStatistics")
 	}
@@ -86,6 +95,7 @@ func verifyExpectedWindowsContainerStatistics(t *testing.T, w *stats.WindowsCont
 }
 
 func verifyExpectedCgroupMetrics(t *testing.T, v *v1.Metrics) {
+	t.Helper()
 	if v == nil {
 		t.Fatal("expected non-nil cgroups Metrics")
 	}
@@ -93,7 +103,7 @@ func verifyExpectedCgroupMetrics(t *testing.T, v *v1.Metrics) {
 		t.Fatal("expected non-nil Metrics.CPU")
 	}
 	if v.CPU.Usage.Total != 100 {
-		t.Fatalf("Expected Metrics.CPU.Usage == 100, got: %d", v.CPU.Usage)
+		t.Fatalf("Expected Metrics.CPU.Usage.Total == 100, got: %d", v.CPU.Usage.Total)
 	}
 	if v.Memory == nil {
 		t.Fatal("expected non-nil Metrics.Memory")
@@ -110,6 +120,7 @@ func verifyExpectedCgroupMetrics(t *testing.T, v *v1.Metrics) {
 }
 
 func verifyExpectedVirtualMachineStatistics(t *testing.T, v *stats.VirtualMachineStatistics) {
+	t.Helper()
 	if v == nil {
 		t.Fatal("expected non-nil VirtualMachineStatistics")
 	}
@@ -124,5 +135,40 @@ func verifyExpectedVirtualMachineStatistics(t *testing.T, v *stats.VirtualMachin
 	}
 	if v.Memory.WorkingSetBytes != 100 {
 		t.Fatalf("expected VirtualMachineStatistics.Memory.WorkingSetBytes == 100, got: %d", v.Memory.WorkingSetBytes)
+	}
+}
+
+func Test_Service_shutdownInternal(t *testing.T) {
+	for _, now := range []bool{true, false} {
+		t.Run(fmt.Sprintf("%s_Now_%t", t.Name(), now), func(t *testing.T) {
+			s, err := NewService(WithTID(t.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if s.IsShutdown() {
+				t.Fatal("service prematurely shutdown")
+			}
+
+			_, err = s.shutdownInternal(context.Background(), &task.ShutdownRequest{
+				ID:  s.tid,
+				Now: now,
+			})
+			if err != nil {
+				t.Fatalf("could not shut down service: %v", err)
+			}
+
+			tm := time.NewTimer(5 * time.Millisecond)
+			select {
+			case <-tm.C:
+				t.Fatalf("shutdown channel did not close")
+			case <-s.Done():
+				tm.Stop()
+			}
+
+			if !s.IsShutdown() {
+				t.Fatal("service did not shutdown")
+			}
+		})
 	}
 }

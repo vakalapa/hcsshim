@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package plan9
@@ -17,7 +18,7 @@ import (
 
 const packetPayloadBytes = 65536
 
-// Test dependencies
+// Test dependencies.
 var (
 	osMkdirAll  = os.MkdirAll
 	osRemoveAll = os.RemoveAll
@@ -29,7 +30,7 @@ var (
 // `target` will be created. On mount failure the created `target` will be
 // automatically cleaned up.
 func Mount(ctx context.Context, vsock transport.Transport, target, share string, port uint32, readonly bool) (err error) {
-	_, span := trace.StartSpan(ctx, "plan9::Mount")
+	_, span := oc.StartSpan(ctx, "plan9::Mount")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 
@@ -44,7 +45,7 @@ func Mount(ctx context.Context, vsock transport.Transport, target, share string,
 	}
 	defer func() {
 		if err != nil {
-			osRemoveAll(target)
+			_ = osRemoveAll(target)
 		}
 	}()
 	conn, err := vsock.Dial(port)

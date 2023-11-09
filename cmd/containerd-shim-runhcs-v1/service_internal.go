@@ -1,31 +1,35 @@
+//go:build windows
+
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
-	runhcsopts "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
-	"github.com/Microsoft/hcsshim/internal/oci"
-	"github.com/Microsoft/hcsshim/internal/shimdiag"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	containerd_v1_types "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/typeurl"
-	google_protobuf1 "github.com/gogo/protobuf/types"
+	"github.com/containerd/containerd/protobuf"
+	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	runhcsopts "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
+	"github.com/Microsoft/hcsshim/internal/extendedtask"
+	"github.com/Microsoft/hcsshim/internal/oci"
+	"github.com/Microsoft/hcsshim/internal/shimdiag"
 )
 
-var empty = &google_protobuf1.Empty{}
+var empty = &emptypb.Empty{}
 
 // getPod returns the pod this shim is tracking or else returns `nil`. It is the
 // callers responsibility to verify that `s.isSandbox == true` before calling
 // this method.
-//
 //
 // If `pod==nil` returns `errdefs.ErrFailedPrecondition`.
 func (s *service) getPod() (shimPod, error) {
@@ -71,7 +75,7 @@ func (s *service) stateInternal(ctx context.Context, req *task.StateRequest) (*t
 func (s *service) createInternal(ctx context.Context, req *task.CreateTaskRequest) (*task.CreateTaskResponse, error) {
 	setupDebuggerEvent()
 
-	var shimOpts *runhcsopts.Options
+	shimOpts := &runhcsopts.Options{}
 	if req.Options != nil {
 		v, err := typeurl.UnmarshalAny(req.Options)
 		if err != nil {
@@ -92,56 +96,61 @@ func (s *service) createInternal(ctx context.Context, req *task.CreateTaskReques
 	f.Close()
 
 	spec = oci.UpdateSpecFromOptions(spec, shimOpts)
+	//expand annotations after defaults have been loaded in from options
+	err = oci.ProcessAnnotations(ctx, &spec)
+	// since annotation expansion is used to toggle security features
+	// raise it rather than suppress and move on
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to process OCI Spec annotations")
+	}
 
-	if len(req.Rootfs) == 0 {
-		// If no mounts are passed via the snapshotter its the callers full
-		// responsibility to manage the storage. Just move on without affecting
-		// the config.json at all.
-		if spec.Windows == nil || len(spec.Windows.LayerFolders) < 2 {
-			return nil, errors.Wrap(errdefs.ErrFailedPrecondition, "no Windows.LayerFolders found in oci spec")
+	// If sandbox isolation is set to hypervisor, make sure the HyperV option
+	// is filled in. This lessens the burden on Containerd to parse our shims
+	// options if we can set this ourselves.
+	if shimOpts.SandboxIsolation == runhcsopts.Options_HYPERVISOR {
+		if spec.Windows == nil {
+			spec.Windows = &specs.Windows{}
 		}
-	} else if len(req.Rootfs) != 1 {
-		return nil, errors.Wrap(errdefs.ErrFailedPrecondition, "Rootfs does not contain exactly 1 mount for the root file system")
-	} else {
+		if spec.Windows.HyperV == nil {
+			spec.Windows.HyperV = &specs.WindowsHyperV{}
+		}
+	}
+
+	var layerFolders []string
+	if spec.Windows != nil {
+		layerFolders = spec.Windows.LayerFolders
+	}
+	if err := validateRootfsAndLayers(req.Rootfs, layerFolders); err != nil {
+		return nil, err
+	}
+
+	// Only work with Windows here.
+	// Parsing of the rootfs mount for Linux containers occurs later.
+	if spec.Linux == nil && len(req.Rootfs) > 0 {
+		// For Windows containers, we work with LayerFolders throughout
+		// much of the creation logic in the shim. If we were given a
+		// rootfs mount, convert it to LayerFolders here.
 		m := req.Rootfs[0]
-		if m.Type != "windows-layer" && m.Type != "lcow-layer" {
-			return nil, errors.Wrapf(errdefs.ErrFailedPrecondition, "unsupported mount type '%s'", m.Type)
+		if m.Type != "windows-layer" {
+			return nil, fmt.Errorf("unsupported Windows mount type: %s", m.Type)
 		}
 
-		// parentLayerPaths are passed in layerN, layerN-1, ..., layer 0
-		//
-		// The OCI spec expects:
-		//   layerN, layerN-1, ..., layer0, scratch
-		var parentLayerPaths []string
-		for _, option := range m.Options {
-			if strings.HasPrefix(option, mount.ParentLayerPathsFlag) {
-				err := json.Unmarshal([]byte(option[len(mount.ParentLayerPathsFlag):]), &parentLayerPaths)
-				if err != nil {
-					return nil, errors.Wrapf(errdefs.ErrFailedPrecondition, "failed to unmarshal parent layer paths from mount: %v", err)
-				}
-			}
-		}
-
-		if m.Type == "lcow-layer" {
-			// If we are creating LCOW make sure that spec.Windows is filled out before
-			// appending layer folders.
-			if spec.Windows == nil {
-				spec.Windows = &specs.Windows{}
-			}
-			if spec.Windows.HyperV == nil {
-				spec.Windows.HyperV = &specs.WindowsHyperV{}
-			}
-		} else if spec.Windows.HyperV == nil {
-			// This is a Windows Argon make sure that we have a Root filled in.
-			if spec.Root == nil {
-				spec.Root = &specs.Root{}
-			}
+		source, parentLayerPaths, err := parseLegacyRootfsMount(m)
+		if err != nil {
+			return nil, err
 		}
 
 		// Append the parents
 		spec.Windows.LayerFolders = append(spec.Windows.LayerFolders, parentLayerPaths...)
 		// Append the scratch
-		spec.Windows.LayerFolders = append(spec.Windows.LayerFolders, m.Source)
+		spec.Windows.LayerFolders = append(spec.Windows.LayerFolders, source)
+	}
+
+	// This is a Windows Argon make sure that we have a Root filled in.
+	if spec.Windows.HyperV == nil {
+		if spec.Root == nil {
+			spec.Root = &specs.Root{}
+		}
 	}
 
 	if req.Terminal && req.Stderr != "" {
@@ -205,21 +214,33 @@ func (s *service) startInternal(ctx context.Context, req *task.StartRequest) (*t
 }
 
 func (s *service) deleteInternal(ctx context.Context, req *task.DeleteRequest) (*task.DeleteResponse, error) {
-	// TODO: JTERRY75 we need to send this to the POD for isSandbox
-
 	t, err := s.getTask(req.ID)
 	if err != nil {
 		return nil, err
 	}
+
 	pid, exitStatus, exitedAt, err := t.DeleteExec(ctx, req.ExecID)
 	if err != nil {
 		return nil, err
 	}
-	// TODO: We should be removing the task after this right?
+
+	// if the delete is for a task and not an exec, remove the pod sandbox's reference to the task
+	if s.isSandbox && req.ExecID == "" {
+		p, err := s.getPod()
+		if err != nil {
+			return nil, errors.Wrapf(err, "could not get pod %q to delete task %q", s.tid, req.ID)
+		}
+		err = p.DeleteTask(ctx, req.ID)
+		if err != nil {
+			return nil, fmt.Errorf("could not delete task %q in pod %q: %w", req.ID, s.tid, err)
+		}
+	}
+	// TODO: check if the pod's workload tasks is empty, and, if so, reset p.taskOrPod to nil
+
 	return &task.DeleteResponse{
 		Pid:        uint32(pid),
 		ExitStatus: exitStatus,
-		ExitedAt:   exitedAt,
+		ExitedAt:   timestamppb.New(exitedAt),
 	}, nil
 }
 
@@ -234,13 +255,13 @@ func (s *service) pidsInternal(ctx context.Context, req *task.PidsRequest) (*tas
 	}
 	processes := make([]*containerd_v1_types.ProcessInfo, len(pids))
 	for i, p := range pids {
-		a, err := typeurl.MarshalAny(&p)
+		a, err := typeurl.MarshalAny(p)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to marshal ProcessDetails for process: %s, task: %s", p.ExecID, req.ID)
 		}
 		proc := &containerd_v1_types.ProcessInfo{
 			Pid:  p.ProcessID,
-			Info: a,
+			Info: protobuf.FromAny(a),
 		}
 		processes[i] = proc
 	}
@@ -249,7 +270,7 @@ func (s *service) pidsInternal(ctx context.Context, req *task.PidsRequest) (*tas
 	}, nil
 }
 
-func (s *service) pauseInternal(ctx context.Context, req *task.PauseRequest) (*google_protobuf1.Empty, error) {
+func (s *service) pauseInternal(ctx context.Context, req *task.PauseRequest) (*emptypb.Empty, error) {
 	/*
 		s.events <- cdevent{
 			topic: runtime.TaskPausedEventTopic,
@@ -261,7 +282,7 @@ func (s *service) pauseInternal(ctx context.Context, req *task.PauseRequest) (*g
 	return nil, errdefs.ErrNotImplemented
 }
 
-func (s *service) resumeInternal(ctx context.Context, req *task.ResumeRequest) (*google_protobuf1.Empty, error) {
+func (s *service) resumeInternal(ctx context.Context, req *task.ResumeRequest) (*emptypb.Empty, error) {
 	/*
 		s.events <- cdevent{
 			topic: runtime.TaskResumedEventTopic,
@@ -273,11 +294,11 @@ func (s *service) resumeInternal(ctx context.Context, req *task.ResumeRequest) (
 	return nil, errdefs.ErrNotImplemented
 }
 
-func (s *service) checkpointInternal(ctx context.Context, req *task.CheckpointTaskRequest) (*google_protobuf1.Empty, error) {
+func (s *service) checkpointInternal(ctx context.Context, req *task.CheckpointTaskRequest) (*emptypb.Empty, error) {
 	return nil, errdefs.ErrNotImplemented
 }
 
-func (s *service) killInternal(ctx context.Context, req *task.KillRequest) (*google_protobuf1.Empty, error) {
+func (s *service) killInternal(ctx context.Context, req *task.KillRequest) (*emptypb.Empty, error) {
 	if s.isSandbox {
 		pod, err := s.getPod()
 		if err != nil {
@@ -302,7 +323,7 @@ func (s *service) killInternal(ctx context.Context, req *task.KillRequest) (*goo
 	return empty, nil
 }
 
-func (s *service) execInternal(ctx context.Context, req *task.ExecProcessRequest) (*google_protobuf1.Empty, error) {
+func (s *service) execInternal(ctx context.Context, req *task.ExecProcessRequest) (*emptypb.Empty, error) {
 	t, err := s.getTask(req.ID)
 	if err != nil {
 		return nil, err
@@ -347,7 +368,67 @@ func (s *service) diagShareInternal(ctx context.Context, req *shimdiag.ShareRequ
 	return &shimdiag.ShareResponse{}, nil
 }
 
-func (s *service) resizePtyInternal(ctx context.Context, req *task.ResizePtyRequest) (*google_protobuf1.Empty, error) {
+func (s *service) diagListExecs(task shimTask) ([]*shimdiag.Exec, error) {
+	var sdExecs []*shimdiag.Exec
+	execs, err := task.ListExecs()
+	if err != nil {
+		return nil, err
+	}
+	for _, exec := range execs {
+		sdExecs = append(sdExecs, &shimdiag.Exec{ID: exec.ID(), State: string(exec.State())})
+	}
+	return sdExecs, nil
+}
+
+func (s *service) diagTasksInternal(ctx context.Context, req *shimdiag.TasksRequest) (_ *shimdiag.TasksResponse, err error) {
+	raw := s.taskOrPod.Load()
+	if raw == nil {
+		return nil, errors.Wrapf(errdefs.ErrNotFound, "task with id: '%s' not found", s.tid)
+	}
+
+	resp := &shimdiag.TasksResponse{}
+	if s.isSandbox {
+		p, ok := raw.(shimPod)
+		if !ok {
+			return nil, errors.New("failed to convert task to pod")
+		}
+
+		tasks, err := p.ListTasks()
+		if err != nil {
+			return nil, err
+		}
+
+		for _, task := range tasks {
+			t := &shimdiag.Task{ID: task.ID()}
+			if req.Execs {
+				t.Execs, err = s.diagListExecs(task)
+				if err != nil {
+					return nil, err
+				}
+			}
+			resp.Tasks = append(resp.Tasks, t)
+		}
+		return resp, nil
+	}
+
+	t, ok := raw.(shimTask)
+	if !ok {
+		return nil, errors.New("failed to convert task to 'shimTask'")
+	}
+
+	task := &shimdiag.Task{ID: t.ID()}
+	if req.Execs {
+		task.Execs, err = s.diagListExecs(t)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	resp.Tasks = []*shimdiag.Task{task}
+	return resp, nil
+}
+
+func (s *service) resizePtyInternal(ctx context.Context, req *task.ResizePtyRequest) (*emptypb.Empty, error) {
 	t, err := s.getTask(req.ID)
 	if err != nil {
 		return nil, err
@@ -363,7 +444,7 @@ func (s *service) resizePtyInternal(ctx context.Context, req *task.ResizePtyRequ
 	return empty, nil
 }
 
-func (s *service) closeIOInternal(ctx context.Context, req *task.CloseIORequest) (*google_protobuf1.Empty, error) {
+func (s *service) closeIOInternal(ctx context.Context, req *task.CloseIORequest) (*emptypb.Empty, error) {
 	t, err := s.getTask(req.ID)
 	if err != nil {
 		return nil, err
@@ -379,7 +460,7 @@ func (s *service) closeIOInternal(ctx context.Context, req *task.CloseIORequest)
 	return empty, nil
 }
 
-func (s *service) updateInternal(ctx context.Context, req *task.UpdateTaskRequest) (*google_protobuf1.Empty, error) {
+func (s *service) updateInternal(ctx context.Context, req *task.UpdateTaskRequest) (*emptypb.Empty, error) {
 	if req.Resources == nil {
 		return nil, errors.Wrapf(errdefs.ErrInvalidArgument, "resources cannot be empty, updating container %s resources failed", req.ID)
 	}
@@ -427,7 +508,7 @@ func (s *service) statsInternal(ctx context.Context, req *task.StatsRequest) (*t
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to marshal Statistics for task: %s", req.ID)
 	}
-	return &task.StatsResponse{Stats: any}, nil
+	return &task.StatsResponse{Stats: protobuf.FromAny(any)}, nil
 }
 
 func (s *service) connectInternal(ctx context.Context, req *task.ConnectRequest) (*task.ConnectResponse, error) {
@@ -439,18 +520,33 @@ func (s *service) connectInternal(ctx context.Context, req *task.ConnectRequest)
 	}, nil
 }
 
-func (s *service) shutdownInternal(ctx context.Context, req *task.ShutdownRequest) (*google_protobuf1.Empty, error) {
+func (s *service) shutdownInternal(ctx context.Context, req *task.ShutdownRequest) (*emptypb.Empty, error) {
 	// Because a pod shim hosts multiple tasks only the init task can issue the
 	// shutdown request.
 	if req.ID != s.tid {
 		return empty, nil
 	}
 
-	if req.Now {
-		os.Exit(0)
-	}
-	// TODO: JTERRY75 if we dont use `now` issue a Shutdown to the ttrpc
-	// connection to drain any active requests.
-	os.Exit(0)
+	s.shutdownOnce.Do(func() {
+		// TODO: should taskOrPod be deleted/set to nil?
+		// TODO: is there any extra leftovers of the shimTask/Pod to clean? ie: verify all handles are closed?
+		s.gracefulShutdown = !req.Now
+		close(s.shutdown)
+	})
+
 	return empty, nil
+}
+
+func (s *service) computeProcessorInfoInternal(ctx context.Context, req *extendedtask.ComputeProcessorInfoRequest) (*extendedtask.ComputeProcessorInfoResponse, error) {
+	t, err := s.getTask(req.ID)
+	if err != nil {
+		return nil, err
+	}
+	info, err := t.ProcessorInfo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &extendedtask.ComputeProcessorInfoResponse{
+		Count: info.count,
+	}, nil
 }

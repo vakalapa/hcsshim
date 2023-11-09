@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package hcsoci
@@ -8,11 +9,13 @@ import (
 
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/internal/oci"
 	"github.com/Microsoft/hcsshim/internal/schemaversion"
+	"github.com/Microsoft/hcsshim/pkg/annotations"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func createLCOWSpec(coi *createOptionsInternal) (*specs.Spec, error) {
+func createLCOWSpec(ctx context.Context, coi *createOptionsInternal) (*specs.Spec, error) {
 	// Remarshal the spec to perform a deep copy.
 	j, err := json.Marshal(coi.Spec)
 	if err != nil {
@@ -44,7 +47,10 @@ func createLCOWSpec(coi *createOptionsInternal) (*specs.Spec, error) {
 		spec.Linux.Resources.HugepageLimits = nil
 		spec.Linux.Resources.Network = nil
 	}
-	spec.Linux.Seccomp = nil
+
+	if oci.ParseAnnotationsBool(ctx, spec.Annotations, annotations.LCOWPrivileged, false) {
+		spec.Linux.Seccomp = nil
+	}
 
 	return spec, nil
 }
@@ -74,10 +80,16 @@ type linuxHostedSystem struct {
 	SchemaVersion    *hcsschema.Version
 	OciBundlePath    string
 	OciSpecification *specs.Spec
+
+	// ScratchDirPath represents the path inside the UVM at which the container scratch
+	// directory is present.  Usually, this is the path at which the container scratch
+	// VHD is mounted inside the UVM. But in case of scratch sharing this is a
+	// directory under the UVM scratch directory.
+	ScratchDirPath string
 }
 
-func createLinuxContainerDocument(ctx context.Context, coi *createOptionsInternal, guestRoot string) (*linuxHostedSystem, error) {
-	spec, err := createLCOWSpec(coi)
+func createLinuxContainerDocument(ctx context.Context, coi *createOptionsInternal, guestRoot, scratchPath string) (*linuxHostedSystem, error) {
+	spec, err := createLCOWSpec(ctx, coi)
 	if err != nil {
 		return nil, err
 	}
@@ -87,5 +99,6 @@ func createLinuxContainerDocument(ctx context.Context, coi *createOptionsInterna
 		SchemaVersion:    schemaversion.SchemaV21(),
 		OciBundlePath:    guestRoot,
 		OciSpecification: spec,
+		ScratchDirPath:   scratchPath,
 	}, nil
 }

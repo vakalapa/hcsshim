@@ -1,3 +1,5 @@
+//go:build windows
+
 package uvm
 
 import (
@@ -6,20 +8,20 @@ import (
 	"os"
 
 	"github.com/Microsoft/go-winio"
-	"github.com/Microsoft/hcsshim/internal/ncproxyttrpc"
-	"github.com/containerd/ttrpc"
-
 	"github.com/Microsoft/go-winio/pkg/guid"
+	"github.com/containerd/ttrpc"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+
 	"github.com/Microsoft/hcsshim/hcn"
-	"github.com/Microsoft/hcsshim/internal/guestrequest"
 	"github.com/Microsoft/hcsshim/internal/hcs/resourcepaths"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/hns"
 	"github.com/Microsoft/hcsshim/internal/log"
-	"github.com/Microsoft/hcsshim/internal/requesttype"
+	"github.com/Microsoft/hcsshim/internal/ncproxyttrpc"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 	"github.com/Microsoft/hcsshim/osversion"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -34,19 +36,11 @@ var (
 	ErrNICNotFound = errors.New("NIC not found in network namespace")
 )
 
-// Network namespace setup is a bit different for templates and clones.
-// For templates and clones we use a special network namespace ID.
-// Details about this can be found in the Networking section of the late-clone wiki page.
-//
 // In this function we take the namespace ID of the namespace that was created for this
-// UVM. We hot add the namespace (with the default ID if this is a template). We get the
-// endpoints associated with this namespace and then hot add those endpoints (by changing
-// their namespace IDs by the deafult IDs if it is a template).
+// UVM. We hot add the namespace. We get the endpoints associated with this namespace
+// and then hot add those endpoints.
 func (uvm *UtilityVM) SetupNetworkNamespace(ctx context.Context, nsid string) error {
 	nsidInsideUVM := nsid
-	if uvm.IsTemplate || uvm.IsClone {
-		nsidInsideUVM = DefaultCloneNetworkNamespaceID
-	}
 
 	// Query endpoints with actual nsid
 	endpoints, err := GetNamespaceEndpoints(ctx, nsid)
@@ -54,35 +48,15 @@ func (uvm *UtilityVM) SetupNetworkNamespace(ctx context.Context, nsid string) er
 		return err
 	}
 
-	// Add the network namespace inside the UVM if it is not a clone. (Clones will
-	// inherit the namespace from template)
-	if !uvm.IsClone {
-		// Get the namespace struct from the actual nsid.
-		hcnNamespace, err := hcn.GetNamespaceByID(nsid)
-		if err != nil {
-			return err
-		}
-
-		// All templates should have a special NSID so that it
-		// will be easier to debug. Override it here.
-		if uvm.IsTemplate {
-			hcnNamespace.Id = nsidInsideUVM
-		}
-
-		if err = uvm.AddNetNS(ctx, hcnNamespace); err != nil {
-			return err
-		}
+	// Add the network namespace inside the UVM.
+	// Get the namespace struct from the actual nsid.
+	hcnNamespace, err := hcn.GetNamespaceByID(nsid)
+	if err != nil {
+		return err
 	}
 
-	// If adding a network endpoint to clones or a template override nsid associated
-	// with it.
-	if uvm.IsClone || uvm.IsTemplate {
-		// replace nsid for each endpoint
-		for _, ep := range endpoints {
-			ep.Namespace = &hns.Namespace{
-				ID: nsidInsideUVM,
-			}
-		}
+	if err = uvm.AddNetNS(ctx, hcnNamespace); err != nil {
+		return err
 	}
 
 	if err = uvm.AddEndpointsToNS(ctx, nsidInsideUVM, endpoints); err != nil {
@@ -343,9 +317,9 @@ func (uvm *UtilityVM) AddNetNS(ctx context.Context, hcnNamespace *hcn.HostComput
 		// dynamically.
 		if uvm.operatingSystem == "windows" {
 			guestNamespace := hcsschema.ModifySettingRequest{
-				GuestRequest: guestrequest.GuestRequest{
-					ResourceType: guestrequest.ResourceTypeNetworkNamespace,
-					RequestType:  requesttype.Add,
+				GuestRequest: guestrequest.ModificationRequest{
+					ResourceType: guestresource.ResourceTypeNetworkNamespace,
+					RequestType:  guestrequest.RequestTypeAdd,
 					Settings:     hcnNamespace,
 				},
 			}
@@ -464,9 +438,9 @@ func (uvm *UtilityVM) RemoveNetNS(ctx context.Context, id string) error {
 					return err
 				}
 				guestNamespace := hcsschema.ModifySettingRequest{
-					GuestRequest: guestrequest.GuestRequest{
-						ResourceType: guestrequest.ResourceTypeNetworkNamespace,
-						RequestType:  requesttype.Remove,
+					GuestRequest: guestrequest.ModificationRequest{
+						ResourceType: guestresource.ResourceTypeNetworkNamespace,
+						RequestType:  guestrequest.RequestTypeRemove,
 						Settings:     hcnNamespace,
 					},
 				}
@@ -505,7 +479,7 @@ func (uvm *UtilityVM) RemoveEndpointsFromNS(ctx context.Context, id string, endp
 	return nil
 }
 
-// RemoveEndpointFromNS removes ``endpoint` in the network
+// RemoveEndpointFromNS removes `endpoint` in the network
 // namespace matching `id`. If no endpoint matching `endpoint.Id` is found in
 // the network namespace this command returns `ErrNICNotFound`.
 //
@@ -535,7 +509,7 @@ func (uvm *UtilityVM) isNetworkNamespaceSupported() bool {
 	return uvm.guestCaps.NamespaceAddRequestSupported
 }
 
-func getNetworkModifyRequest(adapterID string, requestType string, settings interface{}) interface{} {
+func getNetworkModifyRequest(adapterID string, requestType guestrequest.RequestType, settings interface{}) interface{} {
 	if osversion.Build() >= osversion.RS5 {
 		return guestrequest.NetworkModifyRequest{
 			AdapterId:   adapterID,
@@ -555,12 +529,12 @@ func (uvm *UtilityVM) addNIC(ctx context.Context, id string, endpoint *hns.HNSEn
 	// First a pre-add. This is a guest-only request and is only done on Windows.
 	if uvm.operatingSystem == "windows" {
 		preAddRequest := hcsschema.ModifySettingRequest{
-			GuestRequest: guestrequest.GuestRequest{
-				ResourceType: guestrequest.ResourceTypeNetwork,
-				RequestType:  requesttype.Add,
+			GuestRequest: guestrequest.ModificationRequest{
+				ResourceType: guestresource.ResourceTypeNetwork,
+				RequestType:  guestrequest.RequestTypeAdd,
 				Settings: getNetworkModifyRequest(
 					id,
-					requesttype.PreAdd,
+					guestrequest.RequestTypePreAdd,
 					endpoint),
 			},
 		}
@@ -571,7 +545,7 @@ func (uvm *UtilityVM) addNIC(ctx context.Context, id string, endpoint *hns.HNSEn
 
 	// Then the Add itself
 	request := hcsschema.ModifySettingRequest{
-		RequestType:  requesttype.Add,
+		RequestType:  guestrequest.RequestTypeAdd,
 		ResourcePath: fmt.Sprintf(resourcepaths.NetworkResourceFormat, id),
 		Settings: hcsschema.NetworkAdapter{
 			EndpointId: endpoint.Id,
@@ -580,32 +554,45 @@ func (uvm *UtilityVM) addNIC(ctx context.Context, id string, endpoint *hns.HNSEn
 	}
 
 	if uvm.operatingSystem == "windows" {
-		request.GuestRequest = guestrequest.GuestRequest{
-			ResourceType: guestrequest.ResourceTypeNetwork,
-			RequestType:  requesttype.Add,
+		request.GuestRequest = guestrequest.ModificationRequest{
+			ResourceType: guestresource.ResourceTypeNetwork,
+			RequestType:  guestrequest.RequestTypeAdd,
 			Settings: getNetworkModifyRequest(
 				id,
-				requesttype.Add,
+				guestrequest.RequestTypeAdd,
 				nil),
 		}
 	} else {
 		// Verify this version of LCOW supports Network HotAdd
+		s := &guestresource.LCOWNetworkAdapter{
+			NamespaceID:     endpoint.Namespace.ID,
+			ID:              id,
+			MacAddress:      endpoint.MacAddress,
+			IPAddress:       endpoint.IPAddress.String(),
+			PrefixLength:    endpoint.PrefixLength,
+			GatewayAddress:  endpoint.GatewayAddress,
+			DNSSuffix:       endpoint.DNSSuffix,
+			DNSServerList:   endpoint.DNSServerList,
+			EnableLowMetric: endpoint.EnableLowMetric,
+			EncapOverhead:   endpoint.EncapOverhead,
+		}
+		if v6 := endpoint.IPv6Address.To16(); v6 != nil && !v6.IsUnspecified() {
+			// if the address is empty or invalid, endpoint.IPv6Address.String will be "<nil>"
+			// since we should be guranteed an IPv4, but not a v6, skip invalid v6 address
+			s.IPv6Address = v6.String()
+			s.IPv6PrefixLength = endpoint.IPv6PrefixLength
+			s.IPv6GatewayAddress = endpoint.GatewayAddressV6
+			log.G(ctx).WithFields(logrus.Fields{
+				"ip":           s.IPAddress,
+				"prefixLength": s.IPv6PrefixLength,
+				"gateway":      s.IPv6GatewayAddress,
+			}).Debug("adding IPv6 settings")
+		}
 		if uvm.isNetworkNamespaceSupported() {
-			request.GuestRequest = guestrequest.GuestRequest{
-				ResourceType: guestrequest.ResourceTypeNetwork,
-				RequestType:  requesttype.Add,
-				Settings: &guestrequest.LCOWNetworkAdapter{
-					NamespaceID:     endpoint.Namespace.ID,
-					ID:              id,
-					MacAddress:      endpoint.MacAddress,
-					IPAddress:       endpoint.IPAddress.String(),
-					PrefixLength:    endpoint.PrefixLength,
-					GatewayAddress:  endpoint.GatewayAddress,
-					DNSSuffix:       endpoint.DNSSuffix,
-					DNSServerList:   endpoint.DNSServerList,
-					EnableLowMetric: endpoint.EnableLowMetric,
-					EncapOverhead:   endpoint.EncapOverhead,
-				},
+			request.GuestRequest = guestrequest.ModificationRequest{
+				ResourceType: guestresource.ResourceTypeNetwork,
+				RequestType:  guestrequest.RequestTypeAdd,
+				Settings:     s,
 			}
 		}
 	}
@@ -619,7 +606,7 @@ func (uvm *UtilityVM) addNIC(ctx context.Context, id string, endpoint *hns.HNSEn
 
 func (uvm *UtilityVM) removeNIC(ctx context.Context, id string, endpoint *hns.HNSEndpoint) error {
 	request := hcsschema.ModifySettingRequest{
-		RequestType:  requesttype.Remove,
+		RequestType:  guestrequest.RequestTypeRemove,
 		ResourcePath: fmt.Sprintf(resourcepaths.NetworkResourceFormat, id),
 		Settings: hcsschema.NetworkAdapter{
 			EndpointId: endpoint.Id,
@@ -629,19 +616,19 @@ func (uvm *UtilityVM) removeNIC(ctx context.Context, id string, endpoint *hns.HN
 
 	if uvm.operatingSystem == "windows" {
 		request.GuestRequest = hcsschema.ModifySettingRequest{
-			RequestType: requesttype.Remove,
+			RequestType: guestrequest.RequestTypeRemove,
 			Settings: getNetworkModifyRequest(
 				id,
-				requesttype.Remove,
+				guestrequest.RequestTypeRemove,
 				nil),
 		}
 	} else {
 		// Verify this version of LCOW supports Network HotRemove
 		if uvm.isNetworkNamespaceSupported() {
-			request.GuestRequest = guestrequest.GuestRequest{
-				ResourceType: guestrequest.ResourceTypeNetwork,
-				RequestType:  requesttype.Remove,
-				Settings: &guestrequest.LCOWNetworkAdapter{
+			request.GuestRequest = guestrequest.ModificationRequest{
+				ResourceType: guestresource.ResourceTypeNetwork,
+				RequestType:  guestrequest.RequestTypeRemove,
+				Settings: &guestresource.LCOWNetworkAdapter{
 					NamespaceID: endpoint.Namespace.ID,
 					ID:          endpoint.Id,
 				},
@@ -670,9 +657,41 @@ func (uvm *UtilityVM) RemoveAllNICs(ctx context.Context) error {
 // UpdateNIC updates a UVM's network adapter.
 func (uvm *UtilityVM) UpdateNIC(ctx context.Context, id string, settings *hcsschema.NetworkAdapter) error {
 	req := &hcsschema.ModifySettingRequest{
-		RequestType:  requesttype.Update,
+		RequestType:  guestrequest.RequestTypeUpdate,
 		ResourcePath: fmt.Sprintf(resourcepaths.NetworkResourceFormat, id),
 		Settings:     settings,
 	}
 	return uvm.modify(ctx, req)
+}
+
+// AddNICInGuest makes a request to setup a network adapter's interface inside the lcow guest.
+// This is primarily used for adding NICs in the guest that have been VPCI assigned.
+func (uvm *UtilityVM) AddNICInGuest(ctx context.Context, cfg *guestresource.LCOWNetworkAdapter) error {
+	if !uvm.isNetworkNamespaceSupported() {
+		return fmt.Errorf("guest does not support network namespaces and cannot add VF NIC %+v", cfg)
+	}
+	request := hcsschema.ModifySettingRequest{}
+	request.GuestRequest = guestrequest.ModificationRequest{
+		ResourceType: guestresource.ResourceTypeNetwork,
+		RequestType:  guestrequest.RequestTypeAdd,
+		Settings:     cfg,
+	}
+
+	return uvm.modify(ctx, &request)
+}
+
+// RemoveNICInGuest makes a request to remove a network interface inside the lcow guest.
+// This is primarily used for removing NICs in the guest that were VPCI assigned.
+func (uvm *UtilityVM) RemoveNICInGuest(ctx context.Context, cfg *guestresource.LCOWNetworkAdapter) error {
+	if !uvm.isNetworkNamespaceSupported() {
+		return fmt.Errorf("guest does not support network namespaces and cannot remove VF NIC %+v", cfg)
+	}
+	request := hcsschema.ModifySettingRequest{}
+	request.GuestRequest = guestrequest.ModificationRequest{
+		ResourceType: guestresource.ResourceTypeNetwork,
+		RequestType:  guestrequest.RequestTypeRemove,
+		Settings:     cfg,
+	}
+
+	return uvm.modify(ctx, &request)
 }

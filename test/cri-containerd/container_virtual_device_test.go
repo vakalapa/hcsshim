@@ -1,4 +1,5 @@
-// +build functional
+//go:build windows && functional
+// +build windows,functional
 
 package cri_containerd
 
@@ -37,6 +38,7 @@ func makeGPUExecCommand(os string, containerID string) *runtime.ExecSyncRequest 
 // verifyGPUIsPresent is a helper function that runs a command in the container
 // to verify the existence of a GPU and fails the running test is none are found
 func verifyGPUIsPresentLCOW(t *testing.T, client runtime.RuntimeServiceClient, ctx context.Context, containerID string) {
+	t.Helper()
 	execReq := makeGPUExecCommand("linux", containerID)
 	response := execSync(t, client, ctx, execReq)
 	if len(response.Stderr) != 0 {
@@ -48,6 +50,7 @@ func verifyGPUIsPresentLCOW(t *testing.T, client runtime.RuntimeServiceClient, c
 }
 
 func isGPUPresentWCOW(t *testing.T, client runtime.RuntimeServiceClient, ctx context.Context, containerID string) bool {
+	t.Helper()
 	execReq := makeGPUExecCommand("windows", containerID)
 	response := execSync(t, client, ctx, execReq)
 	if len(response.Stderr) != 0 {
@@ -70,6 +73,7 @@ func isGPUPresentWCOW(t *testing.T, client runtime.RuntimeServiceClient, ctx con
 // to verify that there are no GPUs present in the container and fails the running test
 // if any are found
 func verifyGPUIsNotPresentLCOW(t *testing.T, client runtime.RuntimeServiceClient, ctx context.Context, containerID string) {
+	t.Helper()
 	execReq := makeGPUExecCommand("linux", containerID)
 	response := execSync(t, client, ctx, execReq)
 	if len(response.Stderr) == 0 {
@@ -104,6 +108,8 @@ func findTestNvidiaGPULocationPath() (string, error) {
 }
 
 // findTestVirtualDeviceID returns the instance ID of the first generic pcip device on the host
+//
+//nolint:unused // may be used in future tests
 func findTestVirtualDeviceID() (string, error) {
 	out, err := exec.Command(
 		"powershell",
@@ -116,8 +122,6 @@ func findTestVirtualDeviceID() (string, error) {
 }
 
 var lcowPodGPUAnnotations = map[string]string{
-	annotations.KernelDirectBoot:    "false",
-	annotations.AllowOvercommit:     "false",
 	annotations.PreferredRootFSType: "initrd",
 	annotations.VPMemCount:          "0",
 	annotations.VPCIEnabled:         "true",
@@ -125,10 +129,11 @@ var lcowPodGPUAnnotations = map[string]string{
 	// if a given gpu device needs more, this test will fail to create the container
 	// and may hang.
 	annotations.MemoryHighMMIOGapInMB: "64000",
-	annotations.BootFilesRootPath:     testGPUBootFiles,
+	annotations.FullyPhysicallyBacked: "true",
 }
 
 func getGPUContainerRequestLCOW(t *testing.T, podID string, podConfig *runtime.PodSandboxConfig, device *runtime.Device) *runtime.CreateContainerRequest {
+	t.Helper()
 	return &runtime.CreateContainerRequest{
 		Config: &runtime.ContainerConfig{
 			Metadata: &runtime.ContainerMetadata{
@@ -154,6 +159,7 @@ func getGPUContainerRequestLCOW(t *testing.T, podID string, podConfig *runtime.P
 }
 
 func getGPUContainerRequestWCOW(t *testing.T, podID string, podConfig *runtime.PodSandboxConfig, device *runtime.Device) *runtime.CreateContainerRequest {
+	t.Helper()
 	return &runtime.CreateContainerRequest{
 		Config: &runtime.ContainerConfig{
 			Metadata: &runtime.ContainerMetadata{
@@ -271,7 +277,6 @@ func Test_RunContainer_VirtualDevice_GPU_Multiple_LCOW(t *testing.T) {
 	defer cancel()
 
 	for i := 0; i < numContainers; i++ {
-
 		name := t.Name() + "-Container-" + fmt.Sprintf("%d", i)
 		containerRequest.Config.Metadata.Name = name
 

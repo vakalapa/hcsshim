@@ -1,3 +1,5 @@
+//go:build windows
+
 package hcs
 
 import (
@@ -6,12 +8,12 @@ import (
 
 	"github.com/Microsoft/hcsshim/internal/hcs/resourcepaths"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
-	"github.com/Microsoft/hcsshim/internal/requesttype"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
 )
 
 func (uvm *utilityVM) AddNIC(ctx context.Context, nicID, endpointID, macAddr string) error {
 	request := hcsschema.ModifySettingRequest{
-		RequestType:  requesttype.Add,
+		RequestType:  guestrequest.RequestTypeAdd,
 		ResourcePath: fmt.Sprintf(resourcepaths.NetworkResourceFormat, nicID),
 		Settings: hcsschema.NetworkAdapter{
 			EndpointId: endpointID,
@@ -23,7 +25,7 @@ func (uvm *utilityVM) AddNIC(ctx context.Context, nicID, endpointID, macAddr str
 
 func (uvm *utilityVM) RemoveNIC(ctx context.Context, nicID, endpointID, macAddr string) error {
 	request := hcsschema.ModifySettingRequest{
-		RequestType:  requesttype.Remove,
+		RequestType:  guestrequest.RequestTypeRemove,
 		ResourcePath: fmt.Sprintf(resourcepaths.NetworkResourceFormat, nicID),
 		Settings: hcsschema.NetworkAdapter{
 			EndpointId: endpointID,

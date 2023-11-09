@@ -1,3 +1,5 @@
+//go:build windows
+
 package uvm
 
 import (
@@ -8,6 +10,10 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/sirupsen/logrus"
+	"go.opencensus.io/trace"
+	"golang.org/x/sys/windows"
+
 	"github.com/Microsoft/hcsshim/internal/cow"
 	"github.com/Microsoft/hcsshim/internal/hcs"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
@@ -16,9 +22,6 @@ import (
 	"github.com/Microsoft/hcsshim/internal/oc"
 	"github.com/Microsoft/hcsshim/internal/schemaversion"
 	"github.com/Microsoft/hcsshim/osversion"
-	"github.com/sirupsen/logrus"
-	"go.opencensus.io/trace"
-	"golang.org/x/sys/windows"
 )
 
 // Options are the set of options passed to Create() to create a utility vm.
@@ -73,7 +76,7 @@ type Options struct {
 	// far as the container is concerned and it is only able to view the NICs in the compartment it's assigned to.
 	// This is the compartment setup (and behavior) that is followed for V1 HCS schema containers (docker) so
 	// this change brings parity as well. This behavior is gated behind a registry key currently to avoid any
-	// unneccessary behavior and once this restriction is removed then we can remove the need for this variable
+	// unnecessary behavior and once this restriction is removed then we can remove the need for this variable
 	// and the associated annotation as well.
 	DisableCompartmentNamespace bool
 
@@ -90,34 +93,15 @@ type Options struct {
 	// applied to all containers. On Windows it's configurable per container, but we can mimic this for
 	// Windows by just applying the location specified here per container.
 	ProcessDumpLocation string
-}
 
-// compares the create opts used during template creation with the create opts
-// provided for clone creation. If they don't match (except for a few fields)
-// then clone creation is failed.
-func verifyCloneUvmCreateOpts(templateOpts, cloneOpts *OptionsWCOW) bool {
-	// Following fields can be different in the template and clone configurations.
-	// 1. the scratch layer path. i.e the last element of the LayerFolders path.
-	// 2. IsTemplate, IsClone and TemplateConfig variables.
-	// 3. ID
-	// 4. AdditionalHCSDocumentJSON
+	// NoWritableFileShares disables adding any writable vSMB and Plan9 shares to the UVM
+	NoWritableFileShares bool
 
-	// Save the original values of the fields that we want to ignore and replace them with
-	// the same values as that of the other object. So that we can simply use `==` operator.
-	templateIDBackup := templateOpts.ID
-	templateOpts.ID = cloneOpts.ID
+	// The number of SCSI controllers. Defaults to 1 for WCOW and 4 for LCOW
+	SCSIControllerCount uint32
 
-	// We can't use `==` operator on structs which include slices in them. So compare the
-	// Layerfolders separately and then directly compare the Options struct.
-	result := (len(templateOpts.LayerFolders) == len(cloneOpts.LayerFolders))
-	for i := 0; result && i < len(templateOpts.LayerFolders)-1; i++ {
-		result = result && (templateOpts.LayerFolders[i] == cloneOpts.LayerFolders[i])
-	}
-	result = result && (*templateOpts.Options == *cloneOpts.Options)
-
-	// set original values
-	templateOpts.ID = templateIDBackup
-	return result
+	// DumpDirectoryPath is the path of the directory inside which all debug dumps etc are stored.
+	DumpDirectoryPath string
 }
 
 // Verifies that the final UVM options are correct and supported.
@@ -127,8 +111,8 @@ func verifyOptions(ctx context.Context, options interface{}) error {
 		if opts.EnableDeferredCommit && !opts.AllowOvercommit {
 			return errors.New("EnableDeferredCommit is not supported on physically backed VMs")
 		}
-		if opts.SCSIControllerCount > 1 {
-			return errors.New("SCSI controller count must be 0 or 1") // Future extension here for up to 4
+		if opts.SCSIControllerCount > MaxSCSIControllers {
+			return fmt.Errorf("SCSI controller count can't be more than %d", MaxSCSIControllers)
 		}
 		if opts.VPMemDeviceCount > MaxVPMEMCount {
 			return fmt.Errorf("VPMem device count cannot be greater than %d", MaxVPMEMCount)
@@ -136,10 +120,6 @@ func verifyOptions(ctx context.Context, options interface{}) error {
 		if opts.VPMemDeviceCount > 0 {
 			if opts.VPMemSizeBytes%4096 != 0 {
 				return errors.New("VPMemSizeBytes must be a multiple of 4096")
-			}
-		} else {
-			if opts.PreferredRootFSType == PreferredRootFSTypeVHD {
-				return errors.New("PreferredRootFSTypeVHD requires at least one VPMem device")
 			}
 		}
 		if opts.KernelDirect && osversion.Build() < 18286 {
@@ -156,14 +136,8 @@ func verifyOptions(ctx context.Context, options interface{}) error {
 		if len(opts.LayerFolders) < 2 {
 			return errors.New("at least 2 LayerFolders must be supplied")
 		}
-		if opts.IsClone && !verifyCloneUvmCreateOpts(&opts.TemplateConfig.CreateOpts, opts) {
-			return errors.New("clone configuration doesn't match with template configuration")
-		}
-		if opts.IsClone && opts.TemplateConfig == nil {
-			return errors.New("template config can not be nil when creating clone")
-		}
-		if opts.IsTemplate && opts.FullyPhysicallyBacked {
-			return errors.New("template can not be created from a full physically backed UVM")
+		if opts.SCSIControllerCount != 1 {
+			return errors.New("exactly 1 SCSI controller is required for WCOW")
 		}
 	}
 	return nil
@@ -183,6 +157,8 @@ func newDefaultOptions(id, owner string) *Options {
 		EnableDeferredCommit:  false,
 		ProcessorCount:        defaultProcessorCount(),
 		FullyPhysicallyBacked: false,
+		NoWritableFileShares:  false,
+		SCSIControllerCount:   1,
 	}
 
 	if opts.Owner == "" {
@@ -211,7 +187,7 @@ func (uvm *UtilityVM) create(ctx context.Context, doc interface{}) error {
 	defer func() {
 		if system != nil {
 			_ = system.Terminate(ctx)
-			_ = system.Wait()
+			_ = system.WaitCtx(ctx)
 		}
 	}()
 
@@ -232,17 +208,29 @@ func (uvm *UtilityVM) create(ctx context.Context, doc interface{}) error {
 }
 
 // Close terminates and releases resources associated with the utility VM.
-func (uvm *UtilityVM) Close() (err error) {
-	ctx, span := trace.StartSpan(context.Background(), "uvm::Close")
+func (uvm *UtilityVM) Close() error { return uvm.CloseCtx(context.Background()) }
+
+// CloseCtx is similar to [UtilityVM.Close], but accepts a context.
+//
+// The context is used for all operations, including waits, so timeouts/cancellations may prevent
+// proper uVM cleanup.
+func (uvm *UtilityVM) CloseCtx(ctx context.Context) (err error) {
+	ctx, span := oc.StartSpan(ctx, "uvm::Close")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(trace.StringAttribute(logfields.UVMID, uvm.id))
+
+	// TODO: check if uVM already closed
 
 	windows.Close(uvm.vmmemProcess)
 
 	if uvm.hcsSystem != nil {
 		_ = uvm.hcsSystem.Terminate(ctx)
-		_ = uvm.Wait()
+		// uvm.Wait() waits on <-uvm.outputProcessingDone, which may not be closed until below
+		// (for a Create -> Stop without a Start), or uvm.outputHandler may be blocked on IO and
+		// take a while to close.
+		// In either case, we want to wait on the system closing, not IO completion.
+		_ = uvm.hcsSystem.WaitCtx(ctx)
 	}
 
 	if err := uvm.CloseGCSConnection(); err != nil {
@@ -257,9 +245,27 @@ func (uvm *UtilityVM) Close() (err error) {
 		uvm.outputListener.Close()
 		uvm.outputListener = nil
 	}
+
 	if uvm.hcsSystem != nil {
-		return uvm.hcsSystem.Close()
+		// wait for IO to finish
+		// [WaitCtx] calls [uvm.hcsSystem.WaitCtx] again, but since we waited on it above already
+		// it should nop and return without issue.
+		_ = uvm.WaitCtx(ctx)
 	}
+
+	if uvm.confidentialUVMOptions != nil && uvm.confidentialUVMOptions.GuestStateFile != "" {
+		vmgsFullPath := filepath.Join(uvm.confidentialUVMOptions.BundleDirectory, uvm.confidentialUVMOptions.GuestStateFile)
+		e := log.G(ctx).WithField("VMGS file", vmgsFullPath)
+		e.Debug("removing VMGS file")
+		if err := os.Remove(vmgsFullPath); err != nil {
+			e.WithError(err).Error("failed to remove VMGS file")
+		}
+	}
+
+	if uvm.hcsSystem != nil {
+		return uvm.hcsSystem.CloseCtx(ctx)
+	}
+
 	return nil
 }
 
@@ -379,6 +385,10 @@ func (uvm *UtilityVM) DevicesPhysicallyBacked() bool {
 // VSMBNoDirectMap returns if VSMB devices should be mounted with `NoDirectMap` set to true
 func (uvm *UtilityVM) VSMBNoDirectMap() bool {
 	return uvm.vsmbNoDirectMap
+}
+
+func (uvm *UtilityVM) NoWritableFileShares() bool {
+	return uvm.noWritableFileShares
 }
 
 // Closes the external GCS connection if it is being used and also closes the

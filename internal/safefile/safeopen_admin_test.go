@@ -1,4 +1,5 @@
-// +build admin
+//go:build windows && admin
+// +build windows,admin
 
 package safefile
 
@@ -12,19 +13,15 @@ import (
 )
 
 func TestOpenRelative(t *testing.T) {
-	badroot, err := tempRoot()
+	badroot, err := tempRoot(t)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(badroot.Name())
-	defer badroot.Close()
 
-	root, err := tempRoot()
+	root, err := tempRoot(t)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(root.Name())
-	defer root.Close()
 
 	// Create a file
 	f, err := OpenRelative("foo", root, 0, syscall.FILE_SHARE_READ, winapi.FILE_CREATE, 0)
@@ -35,6 +32,12 @@ func TestOpenRelative(t *testing.T) {
 
 	// Create a directory
 	err = MkdirRelative("dir", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a directory stack
+	err = MkdirAllRelative("dir/and/then/some/subdir", root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +66,13 @@ func TestOpenRelative(t *testing.T) {
 	if err == nil {
 		f.Close()
 		t.Fatal("created file in wrong tree!")
+	}
+	t.Log(err)
+
+	// Make sure directory stacks cannot pass through a symlink
+	err = MkdirAllRelative("dsymlink/and/then/some/subdir", root)
+	if err == nil {
+		t.Fatal("created a directory tree through a symlink")
 	}
 	t.Log(err)
 
@@ -116,6 +126,7 @@ func TestOpenRelative(t *testing.T) {
 	// Make sure it's not possible to escape with .. (NT doesn't support .. at the kernel level)
 	f, err = OpenRelative("..", root, syscall.GENERIC_READ, syscall.FILE_SHARE_READ, winapi.FILE_OPEN, 0)
 	if err == nil {
+		f.Close()
 		t.Fatal("escaped the directory")
 	}
 	t.Log(err)

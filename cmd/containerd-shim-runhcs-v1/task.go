@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -7,12 +9,12 @@ import (
 
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/stats"
-	"github.com/Microsoft/hcsshim/internal/gcs"
 	"github.com/Microsoft/hcsshim/internal/hcs"
 	"github.com/Microsoft/hcsshim/internal/shimdiag"
+	"github.com/Microsoft/hcsshim/pkg/ctrdtaskapi"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/runtime/v2/task"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 var (
@@ -36,6 +38,10 @@ type shimTask interface {
 	//
 	// If `eid` is not found this task MUST return `errdefs.ErrNotFound`.
 	GetExec(eid string) (shimExec, error)
+	// GetExecs returns all execs in the task.
+	//
+	// If an exec fails to load, this will return an error.
+	ListExecs() ([]shimExec, error)
 	// KillExec sends `signal` to the exec that matches `eid`. If `all==true`
 	// `eid` MUST be empty and this task will send `signal` to all exec's in the
 	// task and lastly send `signal` to the init exec.
@@ -62,7 +68,7 @@ type shimTask interface {
 	DeleteExec(ctx context.Context, eid string) (int, uint32, time.Time, error)
 	// Pids returns all process pid's in this `shimTask` including ones not
 	// created by the caller via a `CreateExec`.
-	Pids(ctx context.Context) ([]options.ProcessDetails, error)
+	Pids(ctx context.Context) ([]*options.ProcessDetails, error)
 	// Waits for the the init task to complete.
 	//
 	// Note: If the `request.ExecID == ""` the caller should instead call `Wait`
@@ -89,14 +95,22 @@ type shimTask interface {
 	// If the host is hypervisor isolated and this task owns the host additional
 	// metrics on the UVM may be returned as well.
 	Stats(ctx context.Context) (*stats.Statistics, error)
+	// ProcessorInfo returns information on a task's compute system's processor settings
+	ProcessorInfo(ctx context.Context) (*processorInfo, error)
 	// Update updates a task's container
 	Update(ctx context.Context, req *task.UpdateTaskRequest) error
+}
+
+type processorInfo struct {
+	count int32
 }
 
 func verifyTaskUpdateResourcesType(data interface{}) error {
 	switch data.(type) {
 	case *specs.WindowsResources:
 	case *specs.LinuxResources:
+	case *ctrdtaskapi.PolicyFragment:
+	case *ctrdtaskapi.ContainerMount:
 	default:
 		return errNotSupportedResourcesRequest
 	}
@@ -109,6 +123,6 @@ func isStatsNotFound(err error) bool {
 	return errdefs.IsNotFound(err) ||
 		hcs.IsNotExist(err) ||
 		hcs.IsOperationInvalidState(err) ||
-		gcs.IsNotExist(err) ||
-		hcs.IsAccessIsDenied(err)
+		hcs.IsAccessIsDenied(err) ||
+		hcs.IsErrorInvalidHandle(err)
 }

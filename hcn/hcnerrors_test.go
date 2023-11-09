@@ -1,11 +1,13 @@
-// +build integration
+//go:build windows && integration
+// +build windows,integration
 
 package hcn
 
 import (
 	"encoding/json"
-	"github.com/Microsoft/go-winio/pkg/guid"
 	"testing"
+
+	"github.com/Microsoft/go-winio/pkg/guid"
 )
 
 func TestMissingNetworkByName(t *testing.T) {
@@ -64,7 +66,7 @@ func TestEndpointAlreadyExistsError(t *testing.T) {
 	if err != nil {
 		t.Fatal("Failed to create overlay network for setup.", err)
 	}
-	defer testNetwork.Delete()
+	defer testNetwork.Delete() //nolint:errcheck
 	portMappingSetting := PortMappingPolicySetting{
 		Protocol:     17,
 		InternalPort: 45678,
@@ -80,12 +82,12 @@ func TestEndpointAlreadyExistsError(t *testing.T) {
 	if err != nil {
 		t.Fatal("Failed to create endpoint for setup.", err)
 	}
-	defer endpoint.Delete()
+	defer endpoint.Delete() //nolint:errcheck
 
 	endpoint2, err := HcnCreateTestEndpointWithPolicies(testNetwork, []EndpointPolicy{portMappingPolicy})
 	if err == nil {
+		_ = endpoint2.Delete()
 		t.Fatal("Endpoint should have failed with duplicate port mapping.", err)
-		defer endpoint2.Delete()
 	}
 
 	if !IsPortAlreadyExistsError(err) {

@@ -1,3 +1,5 @@
+//go:build windows
+
 package uvm
 
 import (
@@ -5,23 +7,25 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
-	"os"
-	"syscall"
 	"time"
 
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/windows"
+
 	"github.com/Microsoft/hcsshim/internal/gcs"
-	"github.com/Microsoft/hcsshim/internal/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/hcs"
 	"github.com/Microsoft/hcsshim/internal/hcs/schema1"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/logfields"
-	"github.com/Microsoft/hcsshim/internal/requesttype"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/sync/errgroup"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
+	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
 )
 
 // entropyBytes is the number of bytes of random data to send to a Linux UVM
@@ -45,7 +49,7 @@ type gcsLogEntry struct {
 }
 
 // FUTURE-jstarks: Change the GCS log format to include type information
-//                 (e.g. by using a different encoding such as protobuf).
+// (e.g. by using a different encoding such as protobuf).
 func (e *gcsLogEntry) UnmarshalJSON(b []byte) error {
 	// Default the log level to info.
 	e.Level = logrus.InfoLevel
@@ -73,18 +77,17 @@ func (e *gcsLogEntry) UnmarshalJSON(b []byte) error {
 }
 
 func isDisconnectError(err error) bool {
-	if o, ok := err.(*net.OpError); ok {
-		if s, ok := o.Err.(*os.SyscallError); ok {
-			return s.Err == syscall.WSAECONNABORTED || s.Err == syscall.WSAECONNRESET
-		}
-	}
-	return false
+	return hcs.IsAny(err, windows.WSAECONNABORTED, windows.WSAECONNRESET)
 }
 
-func parseLogrus(vmid string) func(r io.Reader) {
+func parseLogrus(o *Options) OutputHandler {
+	vmid := ""
+	if o != nil {
+		vmid = o.ID
+	}
 	return func(r io.Reader) {
 		j := json.NewDecoder(r)
-		e := logrus.NewEntry(logrus.StandardLogger())
+		e := log.L.Dup()
 		fields := e.Data
 		for {
 			for k := range fields {
@@ -95,13 +98,13 @@ func parseLogrus(vmid string) func(r io.Reader) {
 			if err != nil {
 				// Something went wrong. Read the rest of the data as a single
 				// string and log it at once -- it's probably a GCS panic stack.
-				if err != io.EOF && !isDisconnectError(err) {
+				if !errors.Is(err, io.EOF) && !isDisconnectError(err) {
 					logrus.WithFields(logrus.Fields{
 						logfields.UVMID: vmid,
 						logrus.ErrorKey: err,
 					}).Error("gcs log read")
 				}
-				rest, _ := ioutil.ReadAll(io.MultiReader(j.Buffered(), r))
+				rest, _ := io.ReadAll(io.MultiReader(j.Buffered(), r))
 				rest = bytes.TrimSpace(rest)
 				if len(rest) != 0 {
 					logrus.WithFields(logrus.Fields{
@@ -135,9 +138,9 @@ func (uvm *UtilityVM) configureHvSocketForGCS(ctx context.Context) (err error) {
 	}
 
 	conSetupReq := &hcsschema.ModifySettingRequest{
-		GuestRequest: guestrequest.GuestRequest{
-			RequestType:  requesttype.Update,
-			ResourceType: guestrequest.ResourceTypeHvSocket,
+		GuestRequest: guestrequest.ModificationRequest{
+			RequestType:  guestrequest.RequestTypeUpdate,
+			ResourceType: guestresource.ResourceTypeHvSocket,
 			Settings:     hvsocketAddress,
 		},
 	}
@@ -151,12 +154,23 @@ func (uvm *UtilityVM) configureHvSocketForGCS(ctx context.Context) (err error) {
 
 // Start synchronously starts the utility VM.
 func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	// save parent context, without timeout to use in terminate
+	pCtx := ctx
+	ctx, cancel := context.WithTimeout(pCtx, 2*time.Minute)
 	g, gctx := errgroup.WithContext(ctx)
 	defer func() {
 		_ = g.Wait()
 	}()
 	defer cancel()
+
+	// create exitCh ahead of time to prevent race conditions between writing
+	// initalizing the channel and waiting on it during acceptAndClose
+	uvm.exitCh = make(chan struct{})
+
+	e := log.G(ctx).WithField(logfields.UVMID, uvm.id)
+
+	// log errors in the the wait groups, since if multiple go routines return an error,
+	// theres no guarantee on which will be returned.
 
 	// Prepare to provide entropy to the init process in the background. This
 	// must be done in a goroutine since, when using the internal bridge, the
@@ -167,12 +181,14 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 			conn, err := uvm.acceptAndClose(gctx, uvm.entropyListener)
 			uvm.entropyListener = nil
 			if err != nil {
-				return fmt.Errorf("failed to connect to entropy socket: %s", err)
+				e.WithError(err).Error("failed to connect to entropy socket")
+				return fmt.Errorf("failed to connect to entropy socket: %w", err)
 			}
 			defer conn.Close()
 			_, err = io.CopyN(conn, rand.Reader, entropyBytes)
 			if err != nil {
-				return fmt.Errorf("failed to write entropy: %s", err)
+				e.WithError(err).Error("failed to write entropy")
+				return fmt.Errorf("failed to write entropy: %w", err)
 			}
 			return nil
 		})
@@ -183,12 +199,15 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 			conn, err := uvm.acceptAndClose(gctx, uvm.outputListener)
 			uvm.outputListener = nil
 			if err != nil {
+				e.WithError(err).Error("failed to connect to log socket")
 				close(uvm.outputProcessingDone)
-				return fmt.Errorf("failed to connect to log socket: %s", err)
+				return fmt.Errorf("failed to connect to log socket: %w", err)
 			}
 			go func() {
+				e.Trace("uvm output handler starting")
 				uvm.outputHandler(conn)
 				close(uvm.outputProcessingDone)
+				e.Debug("uvm output handler finished")
 			}()
 			return nil
 		})
@@ -200,15 +219,19 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 	}
 	defer func() {
 		if err != nil {
-			_ = uvm.hcsSystem.Terminate(ctx)
-			_ = uvm.hcsSystem.Wait()
+			// use parent context, to prevent 2 minute timout (set above) from overridding terminate operation's
+			// timeout and erroring out prematurely
+			_ = uvm.hcsSystem.Terminate(pCtx)
+			_ = uvm.hcsSystem.WaitCtx(pCtx)
 		}
 	}()
 
 	// Start waiting on the utility VM.
-	uvm.exitCh = make(chan struct{})
 	go func() {
-		err := uvm.hcsSystem.Wait()
+		// the original context may have timeout or propagate a cancellation
+		// copy the original to prevent it affecting the background wait go routine
+		cCtx := log.Copy(context.Background(), pCtx)
+		err := uvm.hcsSystem.WaitCtx(cCtx)
 		if err == nil {
 			err = uvm.hcsSystem.ExitError()
 		}
@@ -251,11 +274,11 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 		// Start the GCS protocol.
 		gcc := &gcs.GuestConnectionConfig{
 			Conn:           conn,
-			Log:            log.G(ctx).WithField(logfields.UVMID, uvm.id),
+			Log:            e,
 			IoListen:       gcs.HvsockIoListen(uvm.runtimeID),
 			InitGuestState: initGuestState,
 		}
-		uvm.gc, err = gcc.Connect(ctx, !uvm.IsClone)
+		uvm.gc, err = gcc.Connect(ctx, true)
 		if err != nil {
 			return err
 		}
@@ -274,6 +297,40 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 		}
 		uvm.guestCaps = properties.GuestConnectionInfo.GuestDefinedCapabilities
 		uvm.protocol = properties.GuestConnectionInfo.ProtocolVersion
+	}
+
+	// Initialize the SCSIManager.
+	var gb scsi.GuestBackend
+	if uvm.gc != nil {
+		gb = scsi.NewBridgeGuestBackend(uvm.gc, uvm.OS())
+	} else {
+		gb = scsi.NewHCSGuestBackend(uvm.hcsSystem, uvm.OS())
+	}
+	guestMountFmt := `c:\mounts\scsi\m%d`
+	if uvm.OS() == "linux" {
+		guestMountFmt = "/run/mounts/scsi/m%d"
+	}
+	mgr, err := scsi.NewManager(
+		scsi.NewHCSHostBackend(uvm.hcsSystem),
+		gb,
+		int(uvm.scsiControllerCount),
+		64, // LUNs per controller, fixed by Hyper-V.
+		guestMountFmt,
+		uvm.reservedSCSISlots)
+	if err != nil {
+		return fmt.Errorf("creating scsi manager: %w", err)
+	}
+	uvm.SCSIManager = mgr
+
+	if uvm.confidentialUVMOptions != nil && uvm.OS() == "linux" {
+		copts := []ConfidentialUVMOpt{
+			WithSecurityPolicy(uvm.confidentialUVMOptions.SecurityPolicy),
+			WithSecurityPolicyEnforcer(uvm.confidentialUVMOptions.SecurityPolicyEnforcer),
+			WithUVMReferenceInfo(defaultLCOWOSBootFilesPath(), uvm.confidentialUVMOptions.UVMReferenceInfoFile),
+		}
+		if err := uvm.SetConfidentialUVMOptions(ctx, copts...); err != nil {
+			return err
+		}
 	}
 
 	return nil

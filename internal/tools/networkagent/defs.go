@@ -1,19 +1,31 @@
+//go:build windows
+
 package main
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"os"
+
+	"github.com/pkg/errors"
 
 	ncproxygrpc "github.com/Microsoft/hcsshim/pkg/ncproxy/ncproxygrpc/v1"
-	"github.com/pkg/errors"
+	nodenetsvcV0 "github.com/Microsoft/hcsshim/pkg/ncproxy/nodenetsvc/v0"
+	nodenetsvc "github.com/Microsoft/hcsshim/pkg/ncproxy/nodenetsvc/v1"
 )
 
 type service struct {
+	nodenetsvc.UnimplementedNodeNetworkServiceServer
+
 	conf                 *config
 	client               ncproxygrpc.NetworkConfigProxyClient
 	containerToNamespace map[string]string
 	endpointToNicID      map[string]string
-	containerToNetwork   map[string]string
+	containerToNetwork   map[string][]string
+}
+
+type v0ServiceWrapper struct {
+	s *service
+	nodenetsvcV0.UnimplementedNodeNetworkServiceServer
 }
 
 type hnsSettings struct {
@@ -21,8 +33,14 @@ type hnsSettings struct {
 	IOVSettings *ncproxygrpc.IovEndpointPolicySetting `json:"iov_settings,omitempty"`
 }
 
+type ncproxynetworkingSettings struct {
+	DeviceID             string `json:"device_id,omitempty"`
+	VirtualFunctionIndex uint32 `json:"virtual_function_index,omitempty"`
+}
+
 type networkingSettings struct {
-	HNSSettings *hnsSettings `json:"hns_settings,omitempty"`
+	HNSSettings               *hnsSettings               `json:"hns_settings,omitempty"`
+	NCProxyNetworkingSettings *ncproxynetworkingSettings `json:"ncproxy_networking_settings,omitempty"`
 }
 
 type config struct {
@@ -38,7 +56,7 @@ type config struct {
 // Reads config from path and returns config struct if path is valid and marshaling
 // succeeds
 func readConfig(path string) (*config, error) {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read config file")
 	}

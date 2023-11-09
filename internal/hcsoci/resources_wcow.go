@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package hcsoci
@@ -12,16 +13,20 @@ import (
 	"path/filepath"
 	"strings"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/pkg/errors"
+
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	"github.com/Microsoft/hcsshim/internal/credentials"
+	"github.com/Microsoft/hcsshim/internal/guestpath"
+	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/layers"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/resources"
 	"github.com/Microsoft/hcsshim/internal/schemaversion"
 	"github.com/Microsoft/hcsshim/internal/uvm"
+	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
 	"github.com/Microsoft/hcsshim/internal/wclayer"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 )
 
 const wcowSandboxMountPath = "C:\\SandboxMounts"
@@ -55,14 +60,16 @@ func allocateWindowsResources(ctx context.Context, coi *createOptionsInternal, r
 
 	if coi.Spec.Root.Path == "" && (coi.HostingSystem != nil || coi.Spec.Windows.HyperV == nil) {
 		log.G(ctx).Debug("hcsshim::allocateWindowsResources mounting storage")
-		containerRootInUVM := r.ContainerRootInUVM()
-		containerRootPath, err := layers.MountContainerLayers(ctx, coi.actualID, coi.Spec.Windows.LayerFolders, containerRootInUVM, "", coi.HostingSystem)
+		containerRootPath, closer, err := layers.MountWCOWLayers(ctx, coi.actualID, coi.Spec.Windows.LayerFolders, "", coi.HostingSystem)
 		if err != nil {
 			return errors.Wrap(err, "failed to mount container storage")
 		}
 		coi.Spec.Root.Path = containerRootPath
-		layers := layers.NewImageLayers(coi.HostingSystem, containerRootInUVM, coi.Spec.Windows.LayerFolders, "", isSandbox)
-		r.SetLayers(layers)
+		// If this is the pause container in a hypervisor-isolated pod, we can skip cleanup of
+		// layers, as that happens automatically when the UVM is terminated.
+		if !isSandbox || coi.HostingSystem == nil {
+			r.SetLayers(closer)
+		}
 	}
 
 	if err := setupMounts(ctx, coi, r); err != nil {
@@ -109,7 +116,7 @@ func allocateWindowsResources(ctx context.Context, coi *createOptionsInternal, r
 		// when driver installation completes, we are guaranteed that the device is ready for use,
 		// so reinstall drivers to make sure the devices are ready when we proceed.
 		// TODO katiewasnothere: we should find a way to avoid reinstalling drivers
-		driverClosers, err := installPodDrivers(ctx, coi.HostingSystem, coi.Spec.Annotations)
+		driverClosers, err := addSpecGuestDrivers(ctx, coi.HostingSystem, coi.Spec.Annotations)
 		if err != nil {
 			return err
 		}
@@ -131,15 +138,14 @@ func setupMounts(ctx context.Context, coi *createOptionsInternal, r *resources.R
 		}
 		switch mount.Type {
 		case "":
-		case "physical-disk":
-		case "virtual-disk":
-		case "extensible-virtual-disk":
+		case MountTypePhysicalDisk:
+		case MountTypeVirtualDisk:
+		case MountTypeExtensibleVirtualDisk:
 		default:
 			return fmt.Errorf("invalid OCI spec - Type '%s' not supported", mount.Type)
 		}
 
 		if coi.HostingSystem != nil && schemaversion.IsV21(coi.actualSchemaVersion) {
-			uvmPath := fmt.Sprintf(uvm.WCOWGlobalMountPrefix, coi.HostingSystem.UVMMountCounter())
 			readOnly := false
 			for _, o := range mount.Options {
 				if strings.ToLower(o) == "ro" {
@@ -148,36 +154,51 @@ func setupMounts(ctx context.Context, coi *createOptionsInternal, r *resources.R
 				}
 			}
 			l := log.G(ctx).WithField("mount", fmt.Sprintf("%+v", mount))
-			if mount.Type == "physical-disk" {
-				l.Debug("hcsshim::allocateWindowsResources Hot-adding SCSI physical disk for OCI mount")
-				scsiMount, err := coi.HostingSystem.AddSCSIPhysicalDisk(ctx, mount.Source, uvmPath, readOnly, mount.Options)
-				if err != nil {
-					return errors.Wrapf(err, "adding SCSI physical disk mount %+v", mount)
-				}
-				r.Add(scsiMount)
-			} else if mount.Type == "virtual-disk" {
-				l.Debug("hcsshim::allocateWindowsResources Hot-adding SCSI virtual disk for OCI mount")
-				scsiMount, err := coi.HostingSystem.AddSCSI(
-					ctx,
-					mount.Source,
-					uvmPath,
-					readOnly,
-					false,
-					mount.Options,
-					uvm.VMAccessTypeIndividual,
+			if mount.Type == MountTypePhysicalDisk || mount.Type == MountTypeVirtualDisk || mount.Type == MountTypeExtensibleVirtualDisk {
+				var (
+					scsiMount *scsi.Mount
+					err       error
 				)
+				switch mount.Type {
+				case MountTypePhysicalDisk:
+					l.Debug("hcsshim::allocateWindowsResources Hot-adding SCSI physical disk for OCI mount")
+					scsiMount, err = coi.HostingSystem.SCSIManager.AddPhysicalDisk(
+						ctx,
+						mount.Source,
+						readOnly,
+						coi.HostingSystem.ID(),
+						&scsi.MountConfig{},
+					)
+				case MountTypeVirtualDisk:
+					l.Debug("hcsshim::allocateWindowsResources Hot-adding SCSI virtual disk for OCI mount")
+					scsiMount, err = coi.HostingSystem.SCSIManager.AddVirtualDisk(
+						ctx,
+						mount.Source,
+						readOnly,
+						coi.HostingSystem.ID(),
+						&scsi.MountConfig{},
+					)
+				case MountTypeExtensibleVirtualDisk:
+					l.Debug("hcsshim::allocateWindowsResource Hot-adding ExtensibleVirtualDisk")
+					scsiMount, err = coi.HostingSystem.SCSIManager.AddExtensibleVirtualDisk(
+						ctx,
+						mount.Source,
+						readOnly,
+						&scsi.MountConfig{},
+					)
+				}
 				if err != nil {
-					return errors.Wrapf(err, "adding SCSI virtual disk mount %+v", mount)
+					return fmt.Errorf("adding SCSI mount %+v: %w", mount, err)
 				}
 				r.Add(scsiMount)
-			} else if mount.Type == "extensible-virtual-disk" {
-				l.Debug("hcsshim::allocateWindowsResource Hot-adding ExtensibleVirtualDisk")
-				scsiMount, err := coi.HostingSystem.AddSCSIExtensibleVirtualDisk(ctx, mount.Source, uvmPath, readOnly)
-				if err != nil {
-					return errors.Wrapf(err, "adding SCSI EVD mount failed %+v", mount)
-				}
-				r.Add(scsiMount)
-			} else if strings.HasPrefix(mount.Source, "sandbox://") {
+				// Compute guest mounts now, and store them, so they can be added to the container doc later.
+				// We do this now because we have access to the guest path through the returned mount object.
+				coi.windowsAdditionalMounts = append(coi.windowsAdditionalMounts, hcsschema.MappedDirectory{
+					HostPath:      scsiMount.GuestPath(),
+					ContainerPath: mount.Destination,
+					ReadOnly:      readOnly,
+				})
+			} else if strings.HasPrefix(mount.Source, guestpath.SandboxMountPrefix) {
 				// Mounts that map to a path in the UVM are specified with a 'sandbox://' prefix.
 				//
 				// Example: sandbox:///a/dirInUvm destination:C:\\dirInContainer.
@@ -227,6 +248,6 @@ func setupMounts(ctx context.Context, coi *createOptionsInternal, r *resources.R
 }
 
 func convertToWCOWSandboxMountPath(source string) string {
-	subPath := strings.TrimPrefix(source, "sandbox://")
+	subPath := strings.TrimPrefix(source, guestpath.SandboxMountPrefix)
 	return filepath.Join(wcowSandboxMountPath, subPath)
 }

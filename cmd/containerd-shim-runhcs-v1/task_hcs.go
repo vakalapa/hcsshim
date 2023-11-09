@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -5,24 +7,28 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	eventstypes "github.com/containerd/containerd/api/events"
+	"github.com/containerd/containerd/api/runtime/task/v2"
+	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/runtime"
-	"github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/typeurl"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/containerd/typeurl/v2"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"go.opencensus.io/trace"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/Microsoft/go-winio/pkg/fs"
 	runhcsopts "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/stats"
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	"github.com/Microsoft/hcsshim/internal/cow"
-	"github.com/Microsoft/hcsshim/internal/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/guestpath"
 	"github.com/Microsoft/hcsshim/internal/hcs"
 	"github.com/Microsoft/hcsshim/internal/hcs/resourcepaths"
 	"github.com/Microsoft/hcsshim/internal/hcs/schema1"
@@ -30,17 +36,19 @@ import (
 	"github.com/Microsoft/hcsshim/internal/hcsoci"
 	"github.com/Microsoft/hcsshim/internal/jobcontainers"
 	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/internal/memory"
+	"github.com/Microsoft/hcsshim/internal/oc"
 	"github.com/Microsoft/hcsshim/internal/oci"
 	"github.com/Microsoft/hcsshim/internal/processorinfo"
-	"github.com/Microsoft/hcsshim/internal/requesttype"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 	"github.com/Microsoft/hcsshim/internal/resources"
 	"github.com/Microsoft/hcsshim/internal/shimdiag"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
+	"github.com/Microsoft/hcsshim/pkg/ctrdtaskapi"
 )
-
-const bytesPerMB = 1024 * 1024
 
 func newHcsStandaloneTask(ctx context.Context, events publisher, req *task.CreateTaskRequest, s *specs.Spec) (shimTask, error) {
 	log.G(ctx).WithField("tid", req.ID).Debug("newHcsStandaloneTask")
@@ -115,8 +123,17 @@ func newHcsStandaloneTask(ctx context.Context, events publisher, req *task.Creat
 }
 
 // createContainer is a generic call to return either a process/hypervisor isolated container, or a job container
-//  based on what is set in the OCI spec.
-func createContainer(ctx context.Context, id, owner, netNS string, s *specs.Spec, parent *uvm.UtilityVM, shimOpts *runhcsopts.Options) (cow.Container, *resources.Resources, error) {
+// based on what is set in the OCI spec.
+func createContainer(
+	ctx context.Context,
+	id,
+	owner,
+	netNS string,
+	s *specs.Spec,
+	parent *uvm.UtilityVM,
+	shimOpts *runhcsopts.Options,
+	rootfs []*types.Mount,
+) (cow.Container, *resources.Resources, error) {
 	var (
 		err       error
 		container cow.Container
@@ -135,6 +152,17 @@ func createContainer(ctx context.Context, id, owner, netNS string, s *specs.Spec
 			Spec:             s,
 			HostingSystem:    parent,
 			NetworkNamespace: netNS,
+		}
+		if s.Linux != nil {
+			var layerFolders []string
+			if s.Windows != nil {
+				layerFolders = s.Windows.LayerFolders
+			}
+			lcowLayers, err := getLCOWLayers(rootfs, layerFolders)
+			if err != nil {
+				return nil, nil, err
+			}
+			opts.LCOWLayers = lcowLayers
 		}
 		if shimOpts != nil {
 			opts.ScaleCPULimitsToSandbox = shimOpts.ScaleCpuLimitsToSandbox
@@ -164,7 +192,6 @@ func newHcsTask(
 	}).Debug("newHcsTask")
 
 	owner := filepath.Base(os.Args[0])
-	isTemplate := oci.ParseAnnotationsSaveAsTemplate(ctx, s)
 
 	var netNS string
 	if s.Windows != nil &&
@@ -191,7 +218,7 @@ func newHcsTask(
 		return nil, err
 	}
 
-	container, resources, err := createContainer(ctx, req.ID, owner, netNS, s, parent, shimOpts)
+	container, resources, err := createContainer(ctx, req.ID, owner, netNS, s, parent, shimOpts, req.Rootfs)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +233,6 @@ func newHcsTask(
 		host:           parent,
 		closed:         make(chan struct{}),
 		taskSpec:       s,
-		isTemplate:     isTemplate,
 		ioRetryTimeout: ioRetryTimeout,
 	}
 	ht.init = newHcsExec(
@@ -229,136 +255,7 @@ func newHcsTask(
 		go ht.waitForHostExit()
 	}
 
-	// In the normal case the `Signal` call from the caller killed this task's
-	// init process. Or the init process ran to completion - this will mostly
-	// happen when we are creating a template and want to wait for init process
-	// to finish before we save the template. In such cases do not tear down the
-	// container after init exits - because we need the container in the template
-	go ht.waitInitExit(!isTemplate)
-
-	// Publish the created event
-	if err := ht.events.publishEvent(
-		ctx,
-		runtime.TaskCreateEventTopic,
-		&eventstypes.TaskCreate{
-			ContainerID: req.ID,
-			Bundle:      req.Bundle,
-			Rootfs:      req.Rootfs,
-			IO: &eventstypes.TaskIO{
-				Stdin:    req.Stdin,
-				Stdout:   req.Stdout,
-				Stderr:   req.Stderr,
-				Terminal: req.Terminal,
-			},
-			Checkpoint: "",
-			Pid:        uint32(ht.init.Pid()),
-		}); err != nil {
-		return nil, err
-	}
-	return ht, nil
-}
-
-// newClonedTask creates a container within `parent`. The parent must be already cloned
-// from a template and hence this container must already be present inside that parent.
-// This function simply creates the go wrapper around the container that is already
-// running inside the cloned parent.
-// This task MAY own the UVM that it is running in but as of now the cloning feature is
-// only used for WCOW hyper-V isolated containers and for WCOW, the wcowPodSandboxTask
-// owns that UVM.
-func newClonedHcsTask(
-	ctx context.Context,
-	events publisher,
-	parent *uvm.UtilityVM,
-	ownsParent bool,
-	req *task.CreateTaskRequest,
-	s *specs.Spec,
-	templateID string) (_ shimTask, err error) {
-	log.G(ctx).WithFields(logrus.Fields{
-		"tid":        req.ID,
-		"ownsParent": ownsParent,
-		"templateid": templateID,
-	}).Debug("newClonedHcsTask")
-
-	owner := filepath.Base(os.Args[0])
-
-	if parent.OS() != "windows" {
-		return nil, fmt.Errorf("cloned task can only be created inside a windows host")
-	}
-
-	var shimOpts *runhcsopts.Options
-	if req.Options != nil {
-		v, err := typeurl.UnmarshalAny(req.Options)
-		if err != nil {
-			return nil, err
-		}
-		shimOpts = v.(*runhcsopts.Options)
-	}
-
-	// Default to an infinite timeout (zero value)
-	var ioRetryTimeout time.Duration
-	if shimOpts != nil {
-		ioRetryTimeout = time.Duration(shimOpts.IoRetryTimeoutInSec) * time.Second
-	}
-	io, err := cmd.NewNpipeIO(ctx, req.Stdin, req.Stdout, req.Stderr, req.Terminal, ioRetryTimeout)
-	if err != nil {
-		return nil, err
-	}
-
-	var netNS string
-	if s.Windows != nil &&
-		s.Windows.Network != nil {
-		netNS = s.Windows.Network.NetworkNamespace
-	}
-
-	// This is a cloned task. Use the templateid as the ID of the container here
-	// because that's the ID of this container inside the UVM.
-	opts := hcsoci.CreateOptions{
-		ID:               templateID,
-		Owner:            owner,
-		Spec:             s,
-		HostingSystem:    parent,
-		NetworkNamespace: netNS,
-	}
-	system, resources, err := hcsoci.CloneContainer(ctx, &opts)
-	if err != nil {
-		return nil, err
-	}
-
-	ht := &hcsTask{
-		events:     events,
-		id:         req.ID,
-		isWCOW:     oci.IsWCOW(s),
-		c:          system,
-		cr:         resources,
-		ownsHost:   ownsParent,
-		host:       parent,
-		closed:     make(chan struct{}),
-		templateID: templateID,
-		taskSpec:   s,
-		isTemplate: false,
-	}
-	ht.init = newClonedExec(
-		ctx,
-		events,
-		req.ID,
-		parent,
-		system,
-		req.ID,
-		req.Bundle,
-		ht.isWCOW,
-		s.Process,
-		io)
-
-	if parent != nil {
-		// We have a parent UVM. Listen for its exit and forcibly close this
-		// task. This is not expected but in the event of a UVM crash we need to
-		// handle this case.
-		go ht.waitForHostExit()
-	}
-
-	// In the normal case the `Signal` call from the caller killed this task's
-	// init process.
-	go ht.waitInitExit(true)
+	go ht.waitInitExit()
 
 	// Publish the created event
 	if err := ht.events.publishEvent(
@@ -428,7 +325,7 @@ type hcsTask struct {
 	host *uvm.UtilityVM
 
 	// ecl is the exec create lock for all non-init execs and MUST be held
-	// durring create to prevent ID duplication.
+	// during create to prevent ID duplication.
 	ecl   sync.Mutex
 	execs sync.Map
 
@@ -437,19 +334,6 @@ type hcsTask struct {
 	// closeHostOnce is used to close `host`. This will only be used if
 	// `ownsHost==true` and `host != nil`.
 	closeHostOnce sync.Once
-
-	// templateID represents the id of the template container from which this container
-	// is cloned. The parent UVM (inside which this container is running) identifies this
-	// container with it's original id (i.e the id that was assigned to this container
-	// at the time of template creation i.e the templateID). Hence, every request that
-	// is sent to the GCS must actually use templateID to reference this container.
-	// A non-empty templateID specifies that this task was cloned.
-	templateID string
-
-	// if isTemplate is true then this container will be saved as a template as soon
-	// as its init process exits. Note: templateID and isTemplate are mutually exclusive.
-	// i.e isTemplate can not be true when templateID is not empty.
-	isTemplate bool
 
 	// taskSpec represents the spec/configuration for this task.
 	taskSpec *specs.Spec
@@ -517,6 +401,23 @@ func (ht *hcsTask) GetExec(eid string) (shimExec, error) {
 	return raw.(shimExec), nil
 }
 
+func (ht *hcsTask) ListExecs() (_ []shimExec, err error) {
+	var execs []shimExec
+	ht.execs.Range(func(key, value interface{}) bool {
+		wt, ok := value.(shimExec)
+		if !ok {
+			err = fmt.Errorf("failed to load exec %q", key)
+			return false
+		}
+		execs = append(execs, wt)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return execs, nil
+}
+
 func (ht *hcsTask) KillExec(ctx context.Context, eid string, signal uint32, all bool) error {
 	e, err := ht.GetExec(eid)
 	if err != nil {
@@ -536,8 +437,9 @@ func (ht *hcsTask) KillExec(ctx context.Context, eid string, signal uint32, all 
 				}).Warn("failed to kill exec in task")
 			}
 
-			// iterate all
-			return false
+			// Iterate all. Returning false stops the iteration. See:
+			// https://pkg.go.dev/sync#Map.Range
+			return true
 		})
 	}
 	if signal == 0x9 && eid == "" && ht.host != nil {
@@ -578,8 +480,9 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 				ex.ForceExit(ctx, 1)
 			}
 
-			// iterate next
-			return false
+			// Iterate all. Returning false stops the iteration. See:
+			// https://pkg.go.dev/sync#Map.Range
+			return true
 		})
 	}
 	switch state := e.State(); state {
@@ -588,6 +491,48 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 	case shimExecStateRunning:
 		return 0, 0, time.Time{}, newExecInvalidStateError(ht.id, eid, state, "delete")
 	}
+
+	if eid == "" {
+		// We are killing the init task, so we expect the container to be
+		// stopped after this.
+		//
+		// The task process may have already exited, and the status set to
+		// shimExecStateExited, but resources may still be in the process
+		// of being cleaned up. Wait for ht.closed to be closed. This signals
+		// that waitInitExit() has finished destroying container resources,
+		// and layers were umounted.
+		// If the shim exits before resources are cleaned up, those resources
+		// will remain locked and untracked, which leads to lingering sandboxes
+		// and container resources like base vhdx.
+		select {
+		case <-time.After(30 * time.Second):
+			log.G(ctx).Error("timed out waiting for resource cleanup")
+			return 0, 0, time.Time{}, errors.Wrap(hcs.ErrTimeout, "waiting for container resource cleanup")
+		case <-ht.closed:
+		}
+
+		// The init task has now exited. A ForceExit() has already been sent to
+		// execs. Cleanup execs and continue.
+		ht.execs.Range(func(key, value interface{}) bool {
+			if key == "" {
+				// Iterate next.
+				return true
+			}
+			ht.execs.Delete(key)
+
+			// Iterate all. Returning false stops the iteration. See:
+			// https://pkg.go.dev/sync#Map.Range
+			return true
+		})
+
+		// cleanup the container directories inside the UVM if required.
+		if ht.host != nil {
+			if err := ht.host.DeleteContainerState(ctx, ht.id); err != nil {
+				log.G(ctx).WithError(err).Errorf("failed to delete container state")
+			}
+		}
+	}
+
 	status := e.Status()
 	if eid != "" {
 		ht.execs.Delete(eid)
@@ -607,32 +552,38 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 		return 0, 0, time.Time{}, err
 	}
 
-	return int(status.Pid), status.ExitStatus, status.ExitedAt, nil
+	return int(status.Pid), status.ExitStatus, status.ExitedAt.AsTime(), nil
 }
 
-func (ht *hcsTask) Pids(ctx context.Context) ([]runhcsopts.ProcessDetails, error) {
+func (ht *hcsTask) Pids(ctx context.Context) ([]*runhcsopts.ProcessDetails, error) {
 	// Map all user created exec's to pid/exec-id
 	pidMap := make(map[int]string)
 	ht.execs.Range(func(key, value interface{}) bool {
 		ex := value.(shimExec)
 		pidMap[ex.Pid()] = ex.ID()
 
-		// Iterate all
-		return false
+		// Iterate all. Returning false stops the iteration. See:
+		// https://pkg.go.dev/sync#Map.Range
+		return true
 	})
 	pidMap[ht.init.Pid()] = ht.init.ID()
 
 	// Get the guest pids
 	props, err := ht.c.Properties(ctx, schema1.PropertyTypeProcessList)
 	if err != nil {
+		if isStatsNotFound(err) {
+			return nil, errors.Wrapf(errdefs.ErrNotFound, "failed to fetch pids: %s", err)
+		}
 		return nil, err
 	}
 
 	// Copy to pid/exec-id pair's
-	pairs := make([]runhcsopts.ProcessDetails, len(props.ProcessList))
+	pairs := make([]*runhcsopts.ProcessDetails, len(props.ProcessList))
 	for i, p := range props.ProcessList {
+		pairs[i] = &runhcsopts.ProcessDetails{}
+
 		pairs[i].ImageName = p.ImageName
-		pairs[i].CreatedAt = p.CreateTimestamp
+		pairs[i].CreatedAt = timestamppb.New(p.CreateTimestamp)
 		pairs[i].KernelTime_100Ns = p.KernelTime100ns
 		pairs[i].MemoryCommitBytes = p.MemoryCommitBytes
 		pairs[i].MemoryWorkingSetPrivateBytes = p.MemoryWorkingSetPrivateBytes
@@ -652,28 +603,16 @@ func (ht *hcsTask) Wait() *task.StateResponse {
 	return ht.init.Wait()
 }
 
-func (ht *hcsTask) waitInitExit(destroyContainer bool) {
-	ctx, span := trace.StartSpan(context.Background(), "hcsTask::waitInitExit")
+func (ht *hcsTask) waitInitExit() {
+	ctx, span := oc.StartSpan(context.Background(), "hcsTask::waitInitExit")
 	defer span.End()
 	span.AddAttributes(trace.StringAttribute("tid", ht.id))
 
 	// Wait for it to exit on its own
 	ht.init.Wait()
 
-	if destroyContainer {
-		// Close the host and event the exit
-		ht.close(ctx)
-	} else {
-		// Close the container's host, but do not close or terminate the container itself
-		ht.closeHost(ctx)
-	}
-
-	if ht.isTemplate {
-		// Save the host as a template
-		if err := saveAsTemplate(ctx, ht); err != nil {
-			log.G(ctx).WithError(err).Error("failed to save as template")
-		}
-	}
+	// Close the host and event the exit
+	ht.close(ctx)
 }
 
 // waitForHostExit waits for the host virtual machine to exit. Once exited
@@ -684,11 +623,11 @@ func (ht *hcsTask) waitInitExit(destroyContainer bool) {
 // Note: For Windows process isolated containers there is no host virtual
 // machine so this should not be called.
 func (ht *hcsTask) waitForHostExit() {
-	ctx, span := trace.StartSpan(context.Background(), "hcsTask::waitForHostExit")
+	ctx, span := oc.StartSpan(context.Background(), "hcsTask::waitForHostExit")
 	defer span.End()
 	span.AddAttributes(trace.StringAttribute("tid", ht.id))
 
-	err := ht.host.Wait()
+	err := ht.host.WaitCtx(ctx)
 	if err != nil {
 		log.G(ctx).WithError(err).Error("failed to wait for host virtual machine exit")
 	} else {
@@ -699,8 +638,9 @@ func (ht *hcsTask) waitForHostExit() {
 		ex := value.(shimExec)
 		ex.ForceExit(ctx, 1)
 
-		// iterate all
-		return false
+		// Iterate all. Returning false stops the iteration. See:
+		// https://pkg.go.dev/sync#Map.Range
+		return true
 	})
 	ht.init.ForceExit(ctx, 1)
 	ht.closeHost(ctx)
@@ -721,6 +661,7 @@ func (ht *hcsTask) close(ctx context.Context) {
 		// testing.
 		if ht.c != nil {
 			// Do our best attempt to tear down the container.
+			// TODO: unify timeout select statements and use [ht.c.WaitCtx] and [context.WithTimeout]
 			var werr error
 			ch := make(chan struct{})
 			go func() {
@@ -740,7 +681,8 @@ func (ht *hcsTask) close(ctx context.Context) {
 						log.G(ctx).WithError(err).Error("failed to wait for container shutdown")
 					}
 				case <-t.C:
-					log.G(ctx).WithError(hcs.ErrTimeout).Error("failed to wait for container shutdown")
+					err = hcs.ErrTimeout
+					log.G(ctx).WithError(err).Error("failed to wait for container shutdown")
 				}
 			}
 
@@ -850,8 +792,8 @@ func (ht *hcsTask) Share(ctx context.Context, req *shimdiag.ShareRequest) error 
 func hcsPropertiesToWindowsStats(props *hcsschema.Properties) *stats.Statistics_Windows {
 	wcs := &stats.Statistics_Windows{Windows: &stats.WindowsContainerStatistics{}}
 	if props.Statistics != nil {
-		wcs.Windows.Timestamp = props.Statistics.Timestamp
-		wcs.Windows.ContainerStartTime = props.Statistics.ContainerStartTime
+		wcs.Windows.Timestamp = timestamppb.New(props.Statistics.Timestamp)
+		wcs.Windows.ContainerStartTime = timestamppb.New(props.Statistics.ContainerStartTime)
 		wcs.Windows.UptimeNS = props.Statistics.Uptime100ns * 100
 		if props.Statistics.Processor != nil {
 			wcs.Windows.Processor = &stats.WindowsContainerProcessorStatistics{
@@ -882,9 +824,13 @@ func hcsPropertiesToWindowsStats(props *hcsschema.Properties) *stats.Statistics_
 func (ht *hcsTask) Stats(ctx context.Context) (*stats.Statistics, error) {
 	s := &stats.Statistics{}
 	props, err := ht.c.PropertiesV2(ctx, hcsschema.PTStatistics)
-	if err != nil && !isStatsNotFound(err) {
+	if err != nil {
+		if isStatsNotFound(err) {
+			return nil, errors.Wrapf(errdefs.ErrNotFound, "failed to fetch stats: %s", err)
+		}
 		return nil, err
 	}
+
 	if props != nil {
 		if ht.isWCOW {
 			s.Container = hcsPropertiesToWindowsStats(props)
@@ -913,7 +859,7 @@ func (ht *hcsTask) Update(ctx context.Context, req *task.UpdateTaskRequest) erro
 	}
 
 	if ht.ownsHost && ht.host != nil {
-		return ht.host.UpdateConstraints(ctx, resources, req.Annotations)
+		return ht.host.Update(ctx, resources, req.Annotations)
 	}
 
 	return ht.updateTaskContainerResources(ctx, resources, req.Annotations)
@@ -921,7 +867,15 @@ func (ht *hcsTask) Update(ctx context.Context, req *task.UpdateTaskRequest) erro
 
 func (ht *hcsTask) updateTaskContainerResources(ctx context.Context, data interface{}, annotations map[string]string) error {
 	if ht.isWCOW {
-		return ht.updateWCOWResources(ctx, data, annotations)
+		switch resources := data.(type) {
+		case *specs.WindowsResources:
+			return ht.updateWCOWResources(ctx, resources, annotations)
+		case *ctrdtaskapi.ContainerMount:
+			// Adding mount to a running container is currently only supported for windows containers
+			return ht.updateWCOWContainerMount(ctx, resources, annotations)
+		default:
+			return errNotSupportedResourcesRequest
+		}
 	}
 
 	return ht.updateLCOWResources(ctx, data, annotations)
@@ -957,13 +911,9 @@ func isValidWindowsCPUResources(c *specs.WindowsCPUResources) bool {
 		(c.Maximum != nil && (c.Count == nil && c.Shares == nil))
 }
 
-func (ht *hcsTask) updateWCOWResources(ctx context.Context, data interface{}, annotations map[string]string) error {
-	resources, ok := data.(*specs.WindowsResources)
-	if !ok {
-		return errors.New("must have resources be type *WindowsResources when updating a wcow container")
-	}
+func (ht *hcsTask) updateWCOWResources(ctx context.Context, resources *specs.WindowsResources, annotations map[string]string) error {
 	if resources.Memory != nil && resources.Memory.Limit != nil {
-		newMemorySizeInMB := *resources.Memory.Limit / bytesPerMB
+		newMemorySizeInMB := *resources.Memory.Limit / memory.MiB
 		memoryLimit := hcsoci.NormalizeMemorySize(ctx, ht.id, newMemorySizeInMB)
 		if err := ht.requestUpdateContainer(ctx, resourcepaths.SiloMemoryResourcePath, memoryLimit); err != nil {
 			return err
@@ -985,7 +935,7 @@ func (ht *hcsTask) updateLCOWResources(ctx context.Context, data interface{}, an
 	if !ok || resources == nil {
 		return errors.New("must have resources be non-nil and type *LinuxResources when updating a lcow container")
 	}
-	settings := guestrequest.LCOWContainerConstraints{
+	settings := guestresource.LCOWContainerConstraints{
 		Linux: *resources,
 	}
 	return ht.requestUpdateContainer(ctx, "", settings)
@@ -996,15 +946,113 @@ func (ht *hcsTask) requestUpdateContainer(ctx context.Context, resourcePath stri
 	if ht.isWCOW {
 		modification = &hcsschema.ModifySettingRequest{
 			ResourcePath: resourcePath,
-			RequestType:  requesttype.Update,
+			RequestType:  guestrequest.RequestTypeUpdate,
 			Settings:     settings,
 		}
 	} else {
-		modification = guestrequest.GuestRequest{
-			ResourceType: guestrequest.ResourceTypeContainerConstraints,
-			RequestType:  requesttype.Update,
+		modification = guestrequest.ModificationRequest{
+			ResourceType: guestresource.ResourceTypeContainerConstraints,
+			RequestType:  guestrequest.RequestTypeUpdate,
 			Settings:     settings,
 		}
 	}
 	return ht.c.Modify(ctx, modification)
+}
+
+func (ht *hcsTask) ProcessorInfo(ctx context.Context) (*processorInfo, error) {
+	if ht.host == nil {
+		return nil, errTaskNotIsolated
+	}
+	if !ht.ownsHost {
+		return nil, errors.New("not implemented")
+	}
+	return &processorInfo{
+		count: ht.host.ProcessorCount(),
+	}, nil
+}
+
+func (ht *hcsTask) requestAddContainerMount(ctx context.Context, resourcePath string, settings interface{}) error {
+	modification := &hcsschema.ModifySettingRequest{
+		ResourcePath: resourcePath,
+		RequestType:  guestrequest.RequestTypeAdd,
+		Settings:     settings,
+	}
+	return ht.c.Modify(ctx, modification)
+}
+
+func isMountTypeSupported(hostPath, mountType string) bool {
+	// currently we only support mounting of host volumes/directories
+	switch mountType {
+	case hcsoci.MountTypeBind, hcsoci.MountTypePhysicalDisk,
+		hcsoci.MountTypeVirtualDisk, hcsoci.MountTypeExtensibleVirtualDisk:
+		return false
+	default:
+		// Ensure that host path is not sandbox://, hugepages://
+		if strings.HasPrefix(hostPath, guestpath.SandboxMountPrefix) ||
+			strings.HasPrefix(hostPath, guestpath.HugePagesMountPrefix) ||
+			strings.HasPrefix(hostPath, guestpath.PipePrefix) {
+			return false
+		} else {
+			// hcsshim treats mountType == "" as a normal directory mount
+			// and this is supported
+			return mountType == ""
+		}
+	}
+}
+
+func (ht *hcsTask) updateWCOWContainerMount(ctx context.Context, resources *ctrdtaskapi.ContainerMount, annotations map[string]string) error {
+	// Hcsschema v2 should be supported
+	if osversion.Build() < osversion.RS5 {
+		// OSVerions < RS5 only support hcsshema v1
+		return fmt.Errorf("hcsschema v1 unsupported")
+	}
+
+	if resources.HostPath == "" || resources.ContainerPath == "" {
+		return fmt.Errorf("invalid OCI spec - a mount must have both host and container path set")
+	}
+
+	// Check for valid mount type
+	if !isMountTypeSupported(resources.HostPath, resources.Type) {
+		return fmt.Errorf("invalid mount type %v. Currently only host volumes/directories can be mounted to running containers", resources.Type)
+	}
+
+	if ht.host == nil {
+		// HCS has a bug where it does not correctly resolve file (not dir) paths
+		// if the path includes a symlink. Therefore, we resolve the path here before
+		// passing it in. The issue does not occur with VSMB, so don't need to worry
+		// about the isolated case.
+		hostPath, err := fs.ResolvePath(resources.HostPath)
+		if err != nil {
+			return errors.Wrapf(err, "failed to resolve path for hostPath %s", resources.HostPath)
+		}
+
+		// process isolated windows container
+		settings := hcsschema.MappedDirectory{
+			HostPath:      hostPath,
+			ContainerPath: resources.ContainerPath,
+			ReadOnly:      resources.ReadOnly,
+		}
+		if err := ht.requestAddContainerMount(ctx, resourcepaths.SiloMappedDirectoryResourcePath, settings); err != nil {
+			return errors.Wrapf(err, "failed to add mount to process isolated container")
+		}
+	} else {
+		// if it is a mount request for a running hyperV WCOW container, we should first mount volume to the
+		// UVM as a VSMB share and then mount to the running container using the src path as seen by the UVM
+		vsmbShare, guestPath, err := ht.host.AddVsmbAndGetSharePath(ctx, resources.HostPath, resources.ContainerPath, resources.ReadOnly)
+		if err != nil {
+			return err
+		}
+		// Add mount to list of resources to be released on container cleanup
+		ht.cr.Add(vsmbShare)
+
+		settings := hcsschema.MappedDirectory{
+			HostPath:      guestPath,
+			ContainerPath: resources.ContainerPath,
+			ReadOnly:      resources.ReadOnly,
+		}
+		if err := ht.requestAddContainerMount(ctx, resourcepaths.SiloMappedDirectoryResourcePath, settings); err != nil {
+			return errors.Wrapf(err, "failed to add mount to hyperV container")
+		}
+	}
+	return nil
 }

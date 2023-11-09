@@ -1,12 +1,13 @@
-// +build functional
+//go:build windows && functional
+// +build windows,functional
 
 package cri_containerd
 
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,12 +15,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Microsoft/hcsshim/pkg/annotations"
 	"github.com/sirupsen/logrus"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+
+	"github.com/Microsoft/hcsshim/pkg/annotations"
+	"github.com/Microsoft/hcsshim/test/pkg/definitions/guestpath"
 )
 
 func runLogRotationContainer(t *testing.T, sandboxRequest *runtime.RunPodSandboxRequest, request *runtime.CreateContainerRequest, log string, logArchive string) {
+	t.Helper()
 	client := newTestRuntimeClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -57,6 +61,7 @@ func runLogRotationContainer(t *testing.T, sandboxRequest *runtime.RunPodSandbox
 }
 
 func runContainerLifetime(t *testing.T, client runtime.RuntimeServiceClient, ctx context.Context, containerID string) {
+	t.Helper()
 	defer removeContainer(t, client, ctx, containerID)
 	startContainer(t, client, ctx, containerID)
 	stopContainer(t, client, ctx, containerID)
@@ -65,16 +70,8 @@ func runContainerLifetime(t *testing.T, client runtime.RuntimeServiceClient, ctx
 func Test_RotateLogs_LCOW(t *testing.T) {
 	requireFeatures(t, featureLCOW)
 
-	image := "alpine:latest"
-	dir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("failed creating temp dir: %v", err)
-	}
-	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Fatalf("failed deleting temp dir: %v", err)
-		}
-	}()
+	image := imageLcowAlpine
+	dir := t.TempDir()
 	log := filepath.Join(dir, "log.txt")
 	logArchive := filepath.Join(dir, "log-archive.txt")
 
@@ -241,8 +238,7 @@ func Test_RunContainer_ForksThenExits_ShowsAsExited_LCOW(t *testing.T) {
 	startContainer(t, client, ctx, containerID)
 	defer stopContainer(t, client, ctx, containerID)
 
-	// Give the container init time to exit.
-	time.Sleep(5 * time.Second)
+	requireContainerState(ctx, t, client, containerID, runtime.ContainerState_CONTAINER_EXITED)
 
 	// Validate that the container shows as exited. Once the container init
 	// dies, the forked background process should be killed off.
@@ -346,134 +342,6 @@ func Test_RunContainer_ZeroVPMEM_Multiple_LCOW(t *testing.T) {
 	defer removeContainer(t, client, ctx, containerIDTwo)
 	startContainer(t, client, ctx, containerIDTwo)
 	defer stopContainer(t, client, ctx, containerIDTwo)
-}
-
-func Test_RunContainer_GMSA_WCOW_Process(t *testing.T) {
-	requireFeatures(t, featureWCOWProcess, featureGMSA)
-
-	credSpec := gmsaSetup(t)
-	pullRequiredImages(t, []string{imageWindowsNanoserver})
-	client := newTestRuntimeClient(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sandboxRequest := getRunPodSandboxRequest(t, wcowProcessRuntimeHandler)
-
-	podID := runPodSandbox(t, client, ctx, sandboxRequest)
-	defer removePodSandbox(t, client, ctx, podID)
-	defer stopPodSandbox(t, client, ctx, podID)
-
-	request := &runtime.CreateContainerRequest{
-		PodSandboxId: podID,
-		Config: &runtime.ContainerConfig{
-			Metadata: &runtime.ContainerMetadata{
-				Name: t.Name() + "-Container",
-			},
-			Image: &runtime.ImageSpec{
-				Image: imageWindowsNanoserver,
-			},
-			Command: []string{
-				"cmd",
-				"/c",
-				"ping",
-				"-t",
-				"127.0.0.1",
-			},
-			Windows: &runtime.WindowsContainerConfig{
-				SecurityContext: &runtime.WindowsContainerSecurityContext{
-					CredentialSpec: credSpec,
-				},
-			},
-		},
-		SandboxConfig: sandboxRequest.Config,
-	}
-
-	containerID := createContainer(t, client, ctx, request)
-	defer removeContainer(t, client, ctx, containerID)
-	startContainer(t, client, ctx, containerID)
-	defer stopContainer(t, client, ctx, containerID)
-
-	// No klist and no powershell available
-	cmd := []string{"cmd", "/c", "set", "USERDNSDOMAIN"}
-	containerExecReq := &runtime.ExecSyncRequest{
-		ContainerId: containerID,
-		Cmd:         cmd,
-		Timeout:     20,
-	}
-	r := execSync(t, client, ctx, containerExecReq)
-	if r.ExitCode != 0 {
-		t.Fatalf("failed with exit code %d running 'set USERDNSDOMAIN': %s", r.ExitCode, string(r.Stderr))
-	}
-	// Check for USERDNSDOMAIN environment variable. This acts as a way tell if a
-	// user is joined to an Active Directory Domain and is successfully
-	// authenticated as a domain identity.
-	if !strings.Contains(string(r.Stdout), "USERDNSDOMAIN") {
-		t.Fatalf("expected to see USERDNSDOMAIN entry")
-	}
-}
-
-func Test_RunContainer_GMSA_WCOW_Hypervisor(t *testing.T) {
-	requireFeatures(t, featureWCOWHypervisor, featureGMSA)
-
-	credSpec := gmsaSetup(t)
-	pullRequiredImages(t, []string{imageWindowsNanoserver})
-	client := newTestRuntimeClient(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sandboxRequest := getRunPodSandboxRequest(t, wcowHypervisorRuntimeHandler)
-
-	podID := runPodSandbox(t, client, ctx, sandboxRequest)
-	defer removePodSandbox(t, client, ctx, podID)
-	defer stopPodSandbox(t, client, ctx, podID)
-
-	request := &runtime.CreateContainerRequest{
-		PodSandboxId: podID,
-		Config: &runtime.ContainerConfig{
-			Metadata: &runtime.ContainerMetadata{
-				Name: t.Name() + "-Container",
-			},
-			Image: &runtime.ImageSpec{
-				Image: imageWindowsNanoserver,
-			},
-			Command: []string{
-				"cmd",
-				"/c",
-				"ping",
-				"-t",
-				"127.0.0.1",
-			},
-			Windows: &runtime.WindowsContainerConfig{
-				SecurityContext: &runtime.WindowsContainerSecurityContext{
-					CredentialSpec: credSpec,
-				},
-			},
-		},
-		SandboxConfig: sandboxRequest.Config,
-	}
-
-	containerID := createContainer(t, client, ctx, request)
-	defer removeContainer(t, client, ctx, containerID)
-	startContainer(t, client, ctx, containerID)
-	defer stopContainer(t, client, ctx, containerID)
-
-	// No klist and no powershell available
-	cmd := []string{"cmd", "/c", "set", "USERDNSDOMAIN"}
-	containerExecReq := &runtime.ExecSyncRequest{
-		ContainerId: containerID,
-		Cmd:         cmd,
-		Timeout:     20,
-	}
-	r := execSync(t, client, ctx, containerExecReq)
-	if r.ExitCode != 0 {
-		t.Fatalf("failed with exit code %d running 'set USERDNSDOMAIN': %s", r.ExitCode, string(r.Stderr))
-	}
-	// Check for USERDNSDOMAIN environment variable. This acts as a way tell if a
-	// user is joined to an Active Directory Domain and is successfully
-	// authenticated as a domain identity.
-	if !strings.Contains(string(r.Stdout), "USERDNSDOMAIN") {
-		t.Fatalf("expected to see USERDNSDOMAIN entry")
-	}
 }
 
 func Test_RunContainer_SandboxDevice_LCOW(t *testing.T) {
@@ -656,6 +524,7 @@ func Test_RunContainer_ShareScratch_LCOW(t *testing.T) {
 }
 
 func findOverlaySize(t *testing.T, ctx context.Context, client runtime.RuntimeServiceClient, cid string) []string {
+	t.Helper()
 	cmd := []string{"df"}
 	containerExecReq := &runtime.ExecSyncRequest{
 		ContainerId: cid,
@@ -861,7 +730,7 @@ func Test_CreateContainer_HugePageMount_LCOW(t *testing.T) {
 			},
 			Mounts: []*runtime.Mount{
 				{
-					HostPath:      "hugepages://2M/hugepage2M",
+					HostPath:      fmt.Sprintf("%s2M/hugepage2M", guestpath.HugePagesMountPrefix),
 					ContainerPath: "/mnt/hugepage2M",
 					Readonly:      false,
 					Propagation:   runtime.MountPropagation_PROPAGATION_BIDIRECTIONAL,
@@ -873,14 +742,14 @@ func Test_CreateContainer_HugePageMount_LCOW(t *testing.T) {
 	request.PodSandboxId = podID
 	request.SandboxConfig = sandboxRequest.Config
 
-	containerId := createContainer(t, client, ctx, request)
-	defer removeContainer(t, client, ctx, containerId)
-	startContainer(t, client, ctx, containerId)
-	defer stopContainer(t, client, ctx, containerId)
+	containerID := createContainer(t, client, ctx, request)
+	defer removeContainer(t, client, ctx, containerID)
+	startContainer(t, client, ctx, containerID)
+	defer stopContainer(t, client, ctx, containerID)
 
 	execCommand := []string{"grep", "-i", "/mnt/hugepage2M", "/proc/mounts"}
 
-	output, errorMsg, exitCode := execContainer(t, client, ctx, containerId, execCommand)
+	output, errorMsg, exitCode := execContainer(t, client, ctx, containerID, execCommand)
 	if exitCode != 0 || len(errorMsg) > 0 {
 		t.Fatalf("failed to exec in hugepage container errorMsg: %s, exitcode: %v\n", errorMsg, exitCode)
 	}
@@ -1003,5 +872,76 @@ func Test_RunContainer_ExecUser_Root_LCOW(t *testing.T) {
 
 	if !strings.Contains(string(r.Stdout), "root") {
 		t.Fatalf("expected user for exec to be 'root', got %q", string(r.Stdout))
+	}
+}
+
+// creates a linux container and attempts to mount a (non-existent) nfs share. Tests if the kernel has the
+// required modules for supporting NFS mount.
+func Test_Container_NFSMount_LCOW(t *testing.T) {
+	requireFeatures(t, featureLCOW)
+
+	pullRequiredLCOWImages(t, []string{imageLcowK8sPause, imageLcowUbuntu})
+
+	client := newTestRuntimeClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// start a privileged pod & container. container must be privileged in order to be able to mount a NFS
+	// share.
+	sandboxRequest := getRunPodSandboxRequest(t, lcowRuntimeHandler)
+	sandboxRequest.Config.Linux = &runtime.LinuxPodSandboxConfig{
+		SecurityContext: &runtime.LinuxSandboxSecurityContext{
+			Privileged: true,
+		},
+	}
+	podID := runPodSandbox(t, client, ctx, sandboxRequest)
+	defer removePodSandbox(t, client, ctx, podID)
+	defer stopPodSandbox(t, client, ctx, podID)
+
+	requestTemplate := getCreateContainerRequest(
+		podID,
+		t.Name()+"-container",
+		imageLcowUbuntu,
+		[]string{"bash", "-c", "while true; do echo 'hello'; sleep 1; done"},
+		sandboxRequest.Config,
+	)
+	requestTemplate.Config.Linux = &runtime.LinuxContainerConfig{
+		SecurityContext: &runtime.LinuxContainerSecurityContext{
+			Privileged: true,
+		},
+	}
+	containerID := createContainer(t, client, ctx, requestTemplate)
+	defer removeContainer(t, client, ctx, containerID)
+	startContainer(t, client, ctx, containerID)
+	defer stopContainer(t, client, ctx, containerID)
+
+	execHelper := func(ctrID string, cmd []string) {
+		t.Helper()
+		stdout, stderr, errcode := execContainer(t, client, ctx, ctrID, cmd)
+		if errcode != 0 {
+			t.Logf("stdout: %s \n\n stderr: %s\n\n", stdout, stderr)
+			t.Fatalf("failed to run '%v'\n: errcode: %d", cmd, errcode)
+		}
+	}
+
+	// setup nfs client
+	nfsdir := "/mnt/nfstest"
+	execHelper(containerID, []string{"apt", "update"})
+	execHelper(containerID, []string{"apt", "install", "-y", "nfs-common"})
+	execHelper(containerID, []string{"mkdir", "-p", nfsdir})
+
+	// There is no NFS daemon running in the container, so it is expected that the mount call fails with
+	// the connection refused error. However getting upto the connection refused error verifies that the
+	// container has all the required NFS client modules to successfully mount a NFS. (This also means
+	// that the kernel was correctly built with the NFS client options). `retry=0` ensures it fails
+	// immediately instead of retrying. If the kernel isn't correctly configured the call would fail with
+	// "No Device" error.
+	stdout, stderr, errcode := execContainer(t, client, ctx, containerID, []string{"mount", "-v", "-t", "nfs", "localhost:/fake/nfs/mount", nfsdir, "-o", "vers=4,minorversion=1,sec=sys,retry=0"})
+	if errcode != 32 { // 32 is mount failure
+		t.Logf("stdout: %s \n\n stderr: %s\n", stdout, stderr)
+		t.Fatalf("mount call is expected to fail with mount failure error code: 32, errcode was %d instead", errcode)
+	} else if !strings.Contains(stderr, "Connection refused") {
+		t.Logf("stdout: %s \n\n stderr: %s\n", stdout, stderr)
+		t.Fatalf("mount call is expected to fail with Connection refused error")
 	}
 }

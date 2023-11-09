@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -5,22 +7,26 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Microsoft/hcsshim/internal/cmd"
-	"github.com/Microsoft/hcsshim/internal/cow"
-	"github.com/Microsoft/hcsshim/internal/guestrequest"
-	"github.com/Microsoft/hcsshim/internal/log"
-	"github.com/Microsoft/hcsshim/internal/signals"
-	"github.com/Microsoft/hcsshim/internal/uvm"
-	"github.com/Microsoft/hcsshim/osversion"
 	eventstypes "github.com/containerd/containerd/api/events"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	containerd_v1_types "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/runtime"
-	"github.com/containerd/containerd/runtime/v2/task"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"go.opencensus.io/trace"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/Microsoft/hcsshim/internal/cmd"
+	"github.com/Microsoft/hcsshim/internal/cow"
+	"github.com/Microsoft/hcsshim/internal/hcs"
+	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/internal/oc"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
+	"github.com/Microsoft/hcsshim/internal/signals"
+	"github.com/Microsoft/hcsshim/internal/uvm"
+	"github.com/Microsoft/hcsshim/osversion"
 )
 
 // newHcsExec creates an exec to track the lifetime of `spec` in `c` which is
@@ -146,11 +152,11 @@ func (he *hcsExec) Status() *task.StateResponse {
 	var s containerd_v1_types.Status
 	switch he.state {
 	case shimExecStateCreated:
-		s = containerd_v1_types.StatusCreated
+		s = containerd_v1_types.Status_CREATED
 	case shimExecStateRunning:
-		s = containerd_v1_types.StatusRunning
+		s = containerd_v1_types.Status_RUNNING
 	case shimExecStateExited:
-		s = containerd_v1_types.StatusStopped
+		s = containerd_v1_types.Status_STOPPED
 	}
 
 	return &task.StateResponse{
@@ -164,7 +170,7 @@ func (he *hcsExec) Status() *task.StateResponse {
 		Stderr:     he.io.StderrPath(),
 		Terminal:   he.io.Terminal(),
 		ExitStatus: he.exitStatus,
-		ExitedAt:   he.exitedAt,
+		ExitedAt:   timestamppb.New(he.exitedAt),
 	}
 }
 
@@ -268,13 +274,13 @@ func (he *hcsExec) Kill(ctx context.Context, signal uint32) error {
 		var options interface{}
 		var err error
 		if he.isWCOW {
-			var opt *guestrequest.SignalProcessOptionsWCOW
+			var opt *guestresource.SignalProcessOptionsWCOW
 			opt, err = signals.ValidateWCOW(int(signal), supported)
 			if opt != nil {
 				options = opt
 			}
 		} else {
-			var opt *guestrequest.SignalProcessOptionsLCOW
+			var opt *guestresource.SignalProcessOptionsLCOW
 			opt, err = signals.ValidateLCOW(int(signal), supported)
 			if opt != nil {
 				options = opt
@@ -285,13 +291,43 @@ func (he *hcsExec) Kill(ctx context.Context, signal uint32) error {
 		}
 		var delivered bool
 		if supported && options != nil {
-			delivered, err = he.p.Process.Signal(ctx, options)
+			if he.isWCOW {
+				// Servercore images block on signaling and wait until the target process
+				// is terminated to return to the caller. This causes issues when graceful
+				// termination of containers is requested (Bug36689012).
+				// To fix this, we deliver the signal to the target process in a separate background
+				// thread so that the caller can wait for the desired timeout before sending
+				// a SIGKILL to the process.
+				// TODO: We can get rid of these changes once the fix to support graceful termination is
+				// made in windows.
+				go func() {
+					signalDelivered, deliveryErr := he.p.Process.Signal(ctx, options)
+
+					if deliveryErr != nil {
+						if !hcs.IsAlreadyStopped(deliveryErr) {
+							// Process is not already stopped and there was a signal delivery error to this process
+							log.G(ctx).WithField("err", deliveryErr).Errorf("Error in delivering signal %d, to pid: %d", signal, he.pid)
+						}
+					}
+					if !signalDelivered {
+						log.G(ctx).Errorf("Error: NotFound; exec: '%s' in task: '%s' not found", he.id, he.tid)
+					}
+				}()
+				delivered, err = true, nil
+			} else {
+				delivered, err = he.p.Process.Signal(ctx, options)
+			}
 		} else {
 			// legacy path before signals support OR if WCOW with signals
 			// support needs to issue a terminate.
 			delivered, err = he.p.Process.Kill(ctx)
 		}
 		if err != nil {
+			if hcs.IsAlreadyStopped(err) {
+				// Desired state is actual state. No use in erroring out just because we couldn't kill
+				// an already dead process.
+				return nil
+			}
 			return err
 		}
 		if !delivered {
@@ -356,7 +392,7 @@ func (he *hcsExec) ForceExit(ctx context.Context, status int) {
 // To transition for a created state the following must be done:
 //
 // 1. Issue `he.processDoneCancel` to unblock the goroutine
-// `he.waitForContainerExit()``.
+// `he.waitForContainerExit()`.
 //
 // 2. Set `he.state`, `he.exitStatus` and `he.exitedAt` to the exited values.
 //
@@ -410,16 +446,16 @@ func (he *hcsExec) exitFromCreatedL(ctx context.Context, status int) {
 //
 // 6. Close `he.exited` channel to unblock any waiters who might have called
 // `Create`/`Wait`/`Start` which is a valid pattern.
-//
-// 7. Finally, save the UVM and this container as a template if specified.
 func (he *hcsExec) waitForExit() {
-	ctx, span := trace.StartSpan(context.Background(), "hcsExec::waitForExit")
+	var err error // this will only save the last error, since we dont return early on error
+	ctx, span := oc.StartSpan(context.Background(), "hcsExec::waitForExit")
 	defer span.End()
+	defer func() { oc.SetSpanStatus(span, err) }()
 	span.AddAttributes(
 		trace.StringAttribute("tid", he.tid),
 		trace.StringAttribute("eid", he.id))
 
-	err := he.p.Process.Wait()
+	err = he.p.Process.Wait()
 	if err != nil {
 		log.G(ctx).WithError(err).Error("failed process Wait")
 	}
@@ -457,7 +493,7 @@ func (he *hcsExec) waitForExit() {
 				ID:          he.id,
 				Pid:         uint32(he.pid),
 				ExitStatus:  he.exitStatus,
-				ExitedAt:    he.exitedAt,
+				ExitedAt:    timestamppb.New(he.exitedAt),
 			}); err != nil {
 			log.G(ctx).WithError(err).Error("failed to publish TaskExitEvent")
 		}
@@ -475,19 +511,15 @@ func (he *hcsExec) waitForExit() {
 //
 // This MUST be called via a goroutine at exec create.
 func (he *hcsExec) waitForContainerExit() {
-	ctx, span := trace.StartSpan(context.Background(), "hcsExec::waitForContainerExit")
+	ctx, span := oc.StartSpan(context.Background(), "hcsExec::waitForContainerExit")
 	defer span.End()
 	span.AddAttributes(
 		trace.StringAttribute("tid", he.tid),
 		trace.StringAttribute("eid", he.id))
 
-	cexit := make(chan struct{})
-	go func() {
-		_ = he.c.Wait()
-		close(cexit)
-	}()
+	// wait for container or process to exit and ckean up resrources
 	select {
-	case <-cexit:
+	case <-he.c.WaitChannel():
 		// Container exited first. We need to force the process into the exited
 		// state and cleanup any resources
 		he.sl.Lock()

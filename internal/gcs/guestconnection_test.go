@@ -1,3 +1,5 @@
+//go:build windows
+
 package gcs
 
 import (
@@ -7,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"strings"
 	"testing"
@@ -18,6 +19,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"go.opencensus.io/trace"
 	"go.opencensus.io/trace/tracestate"
+
+	"github.com/Microsoft/hcsshim/internal/oc"
 )
 
 const pipePortFmt = `\\.\pipe\gctest-port-%d`
@@ -33,6 +36,7 @@ func dialPort(port uint32) (net.Conn, error) {
 }
 
 func simpleGcs(t *testing.T, rwc io.ReadWriteCloser) {
+	t.Helper()
 	defer rwc.Close()
 	err := simpleGcsLoop(t, rwc)
 	if err != nil {
@@ -41,6 +45,7 @@ func simpleGcs(t *testing.T, rwc io.ReadWriteCloser) {
 }
 
 func simpleGcsLoop(t *testing.T, rw io.ReadWriter) error {
+	t.Helper()
 	for {
 		id, typ, b, err := readMessage(rw)
 		if err != nil {
@@ -139,6 +144,7 @@ func simpleGcsLoop(t *testing.T, rw io.ReadWriter) error {
 }
 
 func connectGcs(ctx context.Context, t *testing.T) *GuestConnection {
+	t.Helper()
 	s, c := pipeConn()
 	if ctx != context.Background() && ctx != context.TODO() {
 		go func() {
@@ -229,7 +235,7 @@ func TestGcsCreateProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := ioutil.ReadAll(stdout)
+	b, err := io.ReadAll(stdout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +277,7 @@ func Test_makeRequestNoSpan(t *testing.T) {
 }
 
 func Test_makeRequestWithSpan(t *testing.T) {
-	ctx, span := trace.StartSpan(context.Background(), t.Name())
+	ctx, span := oc.StartSpan(context.Background(), t.Name())
 	defer span.End()
 	r := makeRequest(ctx, t.Name())
 

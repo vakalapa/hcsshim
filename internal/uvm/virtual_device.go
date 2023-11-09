@@ -1,3 +1,5 @@
+//go:build windows
+
 package uvm
 
 import (
@@ -5,10 +7,11 @@ import (
 	"fmt"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
-	"github.com/Microsoft/hcsshim/internal/guestrequest"
+
 	"github.com/Microsoft/hcsshim/internal/hcs/resourcepaths"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
-	"github.com/Microsoft/hcsshim/internal/requesttype"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 )
 
 const (
@@ -74,13 +77,16 @@ func (vpci *VPCIDevice) Release(ctx context.Context) error {
 // and the VPCIDevice is returned.
 // Otherwise, a new request is made to assign the target device indicated by the deviceID
 // onto the UVM. A new VPCIDevice entry is made on the UVM and the VPCIDevice is returned
-// to the caller
-func (uvm *UtilityVM) AssignDevice(ctx context.Context, deviceID string, index uint16) (*VPCIDevice, error) {
-	guid, err := guid.NewV4()
-	if err != nil {
-		return nil, err
+// to the caller.
+// Allow callers to specify the vmbus guid they want the device to show up with.
+func (uvm *UtilityVM) AssignDevice(ctx context.Context, deviceID string, index uint16, vmBusGUID string) (*VPCIDevice, error) {
+	if vmBusGUID == "" {
+		guid, err := guid.NewV4()
+		if err != nil {
+			return nil, err
+		}
+		vmBusGUID = guid.String()
 	}
-	vmBusGUID := guid.String()
 
 	key := VPCIDeviceKey{
 		deviceInstanceID:     deviceID,
@@ -107,7 +113,7 @@ func (uvm *UtilityVM) AssignDevice(ctx context.Context, deviceID string, index u
 
 	request := &hcsschema.ModifySettingRequest{
 		ResourcePath: fmt.Sprintf(resourcepaths.VirtualPCIResourceFormat, vmBusGUID),
-		RequestType:  requesttype.Add,
+		RequestType:  guestrequest.RequestTypeAdd,
 		Settings:     targetDevice,
 	}
 
@@ -117,10 +123,10 @@ func (uvm *UtilityVM) AssignDevice(ctx context.Context, deviceID string, index u
 		// for LCOW, we need to make sure that specific paths relating to the
 		// device exist so they are ready to be used by later
 		// work in openGCS
-		request.GuestRequest = guestrequest.GuestRequest{
-			ResourceType: guestrequest.ResourceTypeVPCIDevice,
-			RequestType:  requesttype.Add,
-			Settings: guestrequest.LCOWMappedVPCIDevice{
+		request.GuestRequest = guestrequest.ModificationRequest{
+			ResourceType: guestresource.ResourceTypeVPCIDevice,
+			RequestType:  guestrequest.RequestTypeAdd,
+			Settings: guestresource.LCOWMappedVPCIDevice{
 				VMBusGUID: vmBusGUID,
 			},
 		}
@@ -162,7 +168,7 @@ func (uvm *UtilityVM) RemoveDevice(ctx context.Context, deviceInstanceID string,
 		delete(uvm.vpciDevices, key)
 		return uvm.modify(ctx, &hcsschema.ModifySettingRequest{
 			ResourcePath: fmt.Sprintf(resourcepaths.VirtualPCIResourceFormat, vpci.VMBusGUID),
-			RequestType:  requesttype.Remove,
+			RequestType:  guestrequest.RequestTypeRemove,
 		})
 	}
 	return nil

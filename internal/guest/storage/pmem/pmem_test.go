@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package pmem
@@ -5,14 +6,13 @@ package pmem
 import (
 	"context"
 	"fmt"
-	"github.com/Microsoft/hcsshim/internal/guest/prot"
 	"os"
 	"testing"
 
-	"github.com/Microsoft/hcsshim/internal/guest/storage/test/policy"
-	"github.com/Microsoft/hcsshim/pkg/securitypolicy"
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
+
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 )
 
 func clearTestDependencies() {
@@ -32,7 +32,7 @@ func Test_Mount_Mkdir_Fails_Error(t *testing.T) {
 	osMkdirAll = func(path string, perm os.FileMode) error {
 		return expectedErr
 	}
-	err := Mount(context.Background(), 0, "", nil, nil, openDoorSecurityPolicyEnforcer())
+	err := Mount(context.Background(), 0, "", nil, nil)
 	if errors.Cause(err) != expectedErr {
 		t.Fatalf("expected err: %v, got: %v", expectedErr, err)
 	}
@@ -56,7 +56,7 @@ func Test_Mount_Mkdir_ExpectedPath(t *testing.T) {
 		// Fake the mount success
 		return nil
 	}
-	err := Mount(context.Background(), 0, target, nil, nil, openDoorSecurityPolicyEnforcer())
+	err := Mount(context.Background(), 0, target, nil, nil)
 	if err != nil {
 		t.Fatalf("expected nil error got: %v", err)
 	}
@@ -80,7 +80,7 @@ func Test_Mount_Mkdir_ExpectedPerm(t *testing.T) {
 		// Fake the mount success
 		return nil
 	}
-	err := Mount(context.Background(), 0, target, nil, nil, openDoorSecurityPolicyEnforcer())
+	err := Mount(context.Background(), 0, target, nil, nil)
 	if err != nil {
 		t.Fatalf("expected nil error got: %v", err)
 	}
@@ -107,7 +107,7 @@ func Test_Mount_Calls_RemoveAll_OnMountFailure(t *testing.T) {
 		// Fake the mount failure to test remove is called
 		return expectedErr
 	}
-	err := Mount(context.Background(), 0, target, nil, nil, openDoorSecurityPolicyEnforcer())
+	err := Mount(context.Background(), 0, target, nil, nil)
 	if errors.Cause(err) != expectedErr {
 		t.Fatalf("expected err: %v, got: %v", expectedErr, err)
 	}
@@ -134,7 +134,7 @@ func Test_Mount_Valid_Source(t *testing.T) {
 		}
 		return nil
 	}
-	err := Mount(context.Background(), device, "/fake/path", nil, nil, openDoorSecurityPolicyEnforcer())
+	err := Mount(context.Background(), device, "/fake/path", nil, nil)
 	if err != nil {
 		t.Fatalf("expected nil err, got: %v", err)
 	}
@@ -157,7 +157,7 @@ func Test_Mount_Valid_Target(t *testing.T) {
 		}
 		return nil
 	}
-	err := Mount(context.Background(), 0, expectedTarget, nil, nil, openDoorSecurityPolicyEnforcer())
+	err := Mount(context.Background(), 0, expectedTarget, nil, nil)
 	if err != nil {
 		t.Fatalf("expected nil err, got: %v", err)
 	}
@@ -180,7 +180,7 @@ func Test_Mount_Valid_FSType(t *testing.T) {
 		}
 		return nil
 	}
-	err := Mount(context.Background(), 0, "/fake/path", nil, nil, openDoorSecurityPolicyEnforcer())
+	err := Mount(context.Background(), 0, "/fake/path", nil, nil)
 	if err != nil {
 		t.Fatalf("expected nil err, got: %v", err)
 	}
@@ -203,7 +203,7 @@ func Test_Mount_Valid_Flags(t *testing.T) {
 		}
 		return nil
 	}
-	err := Mount(context.Background(), 0, "/fake/path", nil, nil, openDoorSecurityPolicyEnforcer())
+	err := Mount(context.Background(), 0, "/fake/path", nil, nil)
 	if err != nil {
 		t.Fatalf("expected nil err, got: %v", err)
 	}
@@ -226,96 +226,17 @@ func Test_Mount_Valid_Data(t *testing.T) {
 		}
 		return nil
 	}
-	err := Mount(context.Background(), 0, "/fake/path", nil, nil, openDoorSecurityPolicyEnforcer())
+	err := Mount(context.Background(), 0, "/fake/path", nil, nil)
 	if err != nil {
 		t.Fatalf("expected nil err, got: %v", err)
 	}
-}
-
-func Test_Security_Policy_Enforcement_Mount_Calls(t *testing.T) {
-	clearTestDependencies()
-
-	osMkdirAll = func(path string, perm os.FileMode) error {
-		return nil
-	}
-
-	unixMount = func(source string, target string, fstype string, flags uintptr, data string) error {
-		return nil
-	}
-
-	enforcer := mountMonitoringSecurityPolicyEnforcer()
-	err := Mount(context.Background(), 0, "/fake/path", nil, nil, enforcer)
-	if err != nil {
-		t.Fatalf("expected nil err, got: %v", err)
-	}
-
-	expectedDeviceMountCalls := 1
-	if enforcer.DeviceMountCalls != expectedDeviceMountCalls {
-		t.Fatalf("expected %d attempt at pmem mount enforcement, got %d", expectedDeviceMountCalls, enforcer.DeviceMountCalls)
-	}
-
-	expectedDeviceUnmountCalls := 0
-	if enforcer.DeviceUnmountCalls != expectedDeviceUnmountCalls {
-		t.Fatalf("expected %d attempt at pmem mount enforcement, got %d", expectedDeviceUnmountCalls, enforcer.DeviceUnmountCalls)
-	}
-
-	expectedOverlay := 0
-	if enforcer.OverlayMountCalls != expectedOverlay {
-		t.Fatalf("expected %d attempts at overlay mount enforcement, got %d", expectedOverlay, enforcer.OverlayMountCalls)
-	}
-}
-
-func Test_Security_Policy_Enforcement_Unmount_Calls(t *testing.T) {
-	clearTestDependencies()
-
-	osMkdirAll = func(path string, perm os.FileMode) error {
-		return nil
-	}
-
-	unixMount = func(source string, target string, fstype string, flags uintptr, data string) error {
-		return nil
-	}
-
-	enforcer := mountMonitoringSecurityPolicyEnforcer()
-	err := Mount(context.Background(), 0, "/fake/path", nil, nil, enforcer)
-	if err != nil {
-		t.Fatalf("expected nil err, got: %v", err)
-	}
-
-	err = Unmount(context.Background(), 0, "/fake/path", nil, nil, enforcer)
-	if err != nil {
-		t.Fatalf("expected nil err, got: %v", err)
-	}
-
-	expectedDeviceMountCalls := 1
-	if enforcer.DeviceMountCalls != expectedDeviceMountCalls {
-		t.Fatalf("expected %d attempt at pmem mount enforcement, got %d", expectedDeviceMountCalls, enforcer.DeviceMountCalls)
-	}
-
-	expectedDeviceUnmountCalls := 1
-	if enforcer.DeviceUnmountCalls != expectedDeviceUnmountCalls {
-		t.Fatalf("expected %d attempt at pmem mount enforcement, got %d", expectedDeviceUnmountCalls, enforcer.DeviceUnmountCalls)
-	}
-
-	expectedOverlay := 0
-	if enforcer.OverlayMountCalls != expectedOverlay {
-		t.Fatalf("expected %d attempts at overlay mount enforcement, got %d", expectedOverlay, enforcer.OverlayMountCalls)
-	}
-}
-
-func openDoorSecurityPolicyEnforcer() securitypolicy.SecurityPolicyEnforcer {
-	return &securitypolicy.OpenDoorSecurityPolicyEnforcer{}
-}
-
-func mountMonitoringSecurityPolicyEnforcer() *policy.MountMonitoringSecurityPolicyEnforcer {
-	return &policy.MountMonitoringSecurityPolicyEnforcer{}
 }
 
 // device mapper tests
 func Test_CreateLinearTarget_And_Mount_Called_With_Correct_Parameters(t *testing.T) {
 	clearTestDependencies()
 
-	mappingInfo := &prot.DeviceMappingInfo{
+	mappingInfo := &guestresource.LCOWVPMemMappingInfo{
 		DeviceOffsetInBytes: 0,
 		DeviceSizeInBytes:   1024,
 	}
@@ -339,7 +260,7 @@ func Test_CreateLinearTarget_And_Mount_Called_With_Correct_Parameters(t *testing
 		return nil
 	}
 
-	createZeroSectorLinearTarget = func(_ context.Context, source, name string, mapping *prot.DeviceMappingInfo) (string, error) {
+	createZeroSectorLinearTarget = func(_ context.Context, source, name string, mapping *guestresource.LCOWVPMemMappingInfo) (string, error) {
 		createZSLTCalled = true
 		if source != expectedSource {
 			t.Errorf("expected createZeroSectorLinearTarget source %s, got %s", expectedSource, source)
@@ -356,7 +277,6 @@ func Test_CreateLinearTarget_And_Mount_Called_With_Correct_Parameters(t *testing
 		expectedTarget,
 		mappingInfo,
 		nil,
-		openDoorSecurityPolicyEnforcer(),
 	); err != nil {
 		t.Fatalf("unexpected error during Mount: %s", err)
 	}
@@ -368,7 +288,7 @@ func Test_CreateLinearTarget_And_Mount_Called_With_Correct_Parameters(t *testing
 func Test_CreateVerityTargetCalled_And_Mount_Called_With_Correct_Parameters(t *testing.T) {
 	clearTestDependencies()
 
-	verityInfo := &prot.DeviceVerityInfo{
+	verityInfo := &guestresource.DeviceVerityInfo{
 		RootDigest: "hash",
 	}
 	expectedVerityName := fmt.Sprintf(verityDeviceFmt, 0, verityInfo.RootDigest)
@@ -386,7 +306,7 @@ func Test_CreateVerityTargetCalled_And_Mount_Called_With_Correct_Parameters(t *t
 		}
 		return nil
 	}
-	createVerityTarget = func(_ context.Context, source, name string, verity *prot.DeviceVerityInfo) (string, error) {
+	createVerityTarget = func(_ context.Context, source, name string, verity *guestresource.DeviceVerityInfo) (string, error) {
 		createVerityTargetCalled = true
 		if source != expectedSource {
 			t.Errorf("expected createVerityTarget source %s, got %s", expectedSource, source)
@@ -403,7 +323,6 @@ func Test_CreateVerityTargetCalled_And_Mount_Called_With_Correct_Parameters(t *t
 		expectedTarget,
 		nil,
 		verityInfo,
-		openDoorSecurityPolicyEnforcer(),
 	); err != nil {
 		t.Fatalf("unexpected Mount failure: %s", err)
 	}
@@ -415,10 +334,10 @@ func Test_CreateVerityTargetCalled_And_Mount_Called_With_Correct_Parameters(t *t
 func Test_CreateLinearTarget_And_CreateVerityTargetCalled_Called_Correctly(t *testing.T) {
 	clearTestDependencies()
 
-	verityInfo := &prot.DeviceVerityInfo{
+	verityInfo := &guestresource.DeviceVerityInfo{
 		RootDigest: "hash",
 	}
-	mapping := &prot.DeviceMappingInfo{
+	mapping := &guestresource.LCOWVPMemMappingInfo{
 		DeviceOffsetInBytes: 0,
 		DeviceSizeInBytes:   1024,
 	}
@@ -431,7 +350,7 @@ func Test_CreateLinearTarget_And_CreateVerityTargetCalled_Called_Correctly(t *te
 	dmVerityCalled := false
 	mountCalled := false
 
-	createZeroSectorLinearTarget = func(_ context.Context, source, name string, mapping *prot.DeviceMappingInfo) (string, error) {
+	createZeroSectorLinearTarget = func(_ context.Context, source, name string, mapping *guestresource.LCOWVPMemMappingInfo) (string, error) {
 		dmLinearCalled = true
 		if source != expectedPMemDevice {
 			t.Errorf("expected createZeroSectorLinearTarget source %s, got %s", expectedPMemDevice, source)
@@ -441,7 +360,7 @@ func Test_CreateLinearTarget_And_CreateVerityTargetCalled_Called_Correctly(t *te
 		}
 		return mapperLinearPath, nil
 	}
-	createVerityTarget = func(_ context.Context, source, name string, verity *prot.DeviceVerityInfo) (string, error) {
+	createVerityTarget = func(_ context.Context, source, name string, verity *guestresource.DeviceVerityInfo) (string, error) {
 		dmVerityCalled = true
 		if source != mapperLinearPath {
 			t.Errorf("expected createVerityTarget source %s, got %s", mapperLinearPath, source)
@@ -465,7 +384,6 @@ func Test_CreateLinearTarget_And_CreateVerityTargetCalled_Called_Correctly(t *te
 		"/foo",
 		mapping,
 		verityInfo,
-		openDoorSecurityPolicyEnforcer(),
 	); err != nil {
 		t.Fatalf("unexpected error during Mount call: %s", err)
 	}
@@ -483,7 +401,7 @@ func Test_CreateLinearTarget_And_CreateVerityTargetCalled_Called_Correctly(t *te
 func Test_RemoveDevice_Called_For_LinearTarget_On_MountInternalFailure(t *testing.T) {
 	clearTestDependencies()
 
-	mappingInfo := &prot.DeviceMappingInfo{
+	mappingInfo := &guestresource.LCOWVPMemMappingInfo{
 		DeviceOffsetInBytes: 0,
 		DeviceSizeInBytes:   1024,
 	}
@@ -492,7 +410,7 @@ func Test_RemoveDevice_Called_For_LinearTarget_On_MountInternalFailure(t *testin
 	mapperPath := fmt.Sprintf("/dev/mapper/%s", expectedTarget)
 	removeDeviceCalled := false
 
-	createZeroSectorLinearTarget = func(_ context.Context, source, name string, mapping *prot.DeviceMappingInfo) (string, error) {
+	createZeroSectorLinearTarget = func(_ context.Context, source, name string, mapping *guestresource.LCOWVPMemMappingInfo) (string, error) {
 		return mapperPath, nil
 	}
 	mountInternal = func(_ context.Context, source, target string) error {
@@ -512,7 +430,6 @@ func Test_RemoveDevice_Called_For_LinearTarget_On_MountInternalFailure(t *testin
 		"/foo",
 		mappingInfo,
 		nil,
-		openDoorSecurityPolicyEnforcer(),
 	); err != expectedError {
 		t.Fatalf("expected Mount error %s, got %s", expectedError, err)
 	}
@@ -524,7 +441,7 @@ func Test_RemoveDevice_Called_For_LinearTarget_On_MountInternalFailure(t *testin
 func Test_RemoveDevice_Called_For_VerityTarget_On_MountInternalFailure(t *testing.T) {
 	clearTestDependencies()
 
-	verity := &prot.DeviceVerityInfo{
+	verity := &guestresource.DeviceVerityInfo{
 		RootDigest: "hash",
 	}
 	expectedVerityTarget := fmt.Sprintf(verityDeviceFmt, 0, verity.RootDigest)
@@ -532,7 +449,7 @@ func Test_RemoveDevice_Called_For_VerityTarget_On_MountInternalFailure(t *testin
 	mapperPath := fmt.Sprintf("/dev/mapper/%s", expectedVerityTarget)
 	removeDeviceCalled := false
 
-	createVerityTarget = func(_ context.Context, source, name string, verity *prot.DeviceVerityInfo) (string, error) {
+	createVerityTarget = func(_ context.Context, source, name string, verity *guestresource.DeviceVerityInfo) (string, error) {
 		return mapperPath, nil
 	}
 	mountInternal = func(_ context.Context, _, _ string) error {
@@ -552,7 +469,6 @@ func Test_RemoveDevice_Called_For_VerityTarget_On_MountInternalFailure(t *testin
 		"/foo",
 		nil,
 		verity,
-		openDoorSecurityPolicyEnforcer(),
 	); err != expectedError {
 		t.Fatalf("expected Mount error %s, got %s", expectedError, err)
 	}
@@ -564,11 +480,11 @@ func Test_RemoveDevice_Called_For_VerityTarget_On_MountInternalFailure(t *testin
 func Test_RemoveDevice_Called_For_Both_Targets_On_MountInternalFailure(t *testing.T) {
 	clearTestDependencies()
 
-	mapping := &prot.DeviceMappingInfo{
+	mapping := &guestresource.LCOWVPMemMappingInfo{
 		DeviceOffsetInBytes: 0,
 		DeviceSizeInBytes:   1024,
 	}
-	verity := &prot.DeviceVerityInfo{
+	verity := &guestresource.DeviceVerityInfo{
 		RootDigest: "hash",
 	}
 	expectedError := errors.New("mountInternal error")
@@ -580,13 +496,13 @@ func Test_RemoveDevice_Called_For_Both_Targets_On_MountInternalFailure(t *testin
 	rmLinearCalled := false
 	rmVerityCalled := false
 
-	createZeroSectorLinearTarget = func(_ context.Context, source, name string, m *prot.DeviceMappingInfo) (string, error) {
+	createZeroSectorLinearTarget = func(_ context.Context, source, name string, m *guestresource.LCOWVPMemMappingInfo) (string, error) {
 		if source != expectedPMemDevice {
 			t.Errorf("expected createZeroSectorLinearTarget source %s, got %s", expectedPMemDevice, source)
 		}
 		return mapperLinearPath, nil
 	}
-	createVerityTarget = func(_ context.Context, source, name string, v *prot.DeviceVerityInfo) (string, error) {
+	createVerityTarget = func(_ context.Context, source, name string, v *guestresource.DeviceVerityInfo) (string, error) {
 		if source != mapperLinearPath {
 			t.Errorf("expected createVerityTarget to be called with %s, got %s", mapperLinearPath, source)
 		}
@@ -617,7 +533,6 @@ func Test_RemoveDevice_Called_For_Both_Targets_On_MountInternalFailure(t *testin
 		"/foo",
 		mapping,
 		verity,
-		openDoorSecurityPolicyEnforcer(),
 	); err != expectedError {
 		t.Fatalf("expected Mount error %s, got %s", expectedError, err)
 	}

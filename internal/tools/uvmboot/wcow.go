@@ -1,19 +1,20 @@
+//go:build windows
+
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/Microsoft/hcsshim/internal/cmd"
+	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/containerd/console"
-	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
 
@@ -70,7 +71,7 @@ var wcowCommand = cli.Command{
 					return err
 				}
 			}
-			tempDir, err := ioutil.TempDir("", "uvmboot")
+			tempDir, err := os.MkdirTemp("", "uvmboot")
 			if err != nil {
 				return err
 			}
@@ -87,7 +88,7 @@ var wcowCommand = cli.Command{
 			if wcowCommandLine != "" {
 				cmd := cmd.Command(vm, "cmd.exe", "/c", wcowCommandLine)
 				cmd.Spec.User.Username = `NT AUTHORITY\SYSTEM`
-				cmd.Log = logrus.NewEntry(logrus.StandardLogger())
+				cmd.Log = log.L.Dup()
 				if wcowUseTerminal {
 					cmd.Spec.Terminal = true
 					cmd.Stdin = os.Stdin
@@ -135,7 +136,7 @@ func getLayers(imageName string) ([]string, error) {
 
 func getLayerChain(layerFolder string) ([]string, error) {
 	jPath := filepath.Join(layerFolder, "layerchain.json")
-	content, err := ioutil.ReadFile(jPath)
+	content, err := os.ReadFile(jPath)
 	if err != nil {
 		return nil, err
 	}

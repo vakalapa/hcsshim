@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package storage
@@ -10,10 +11,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/Microsoft/hcsshim/internal/oc"
 	"github.com/pkg/errors"
 	"go.opencensus.io/trace"
 	"golang.org/x/sys/unix"
+
+	"github.com/Microsoft/hcsshim/internal/oc"
 )
 
 const procMountFile = "/proc/mounts"
@@ -99,13 +101,13 @@ func ParseMountOptions(options []string) (flagOpts uintptr, pgFlags []uintptr, d
 // Expected that the filepath exists before calling this function
 func MountRShared(path string) error {
 	if path == "" {
-		return errors.New("Path must not be empty to mount as rshared")
+		return errors.New("path must not be empty to mount as rshared")
 	}
 	if err := unixMount(path, path, "", syscall.MS_BIND, ""); err != nil {
-		return fmt.Errorf("Failed to create bind mount for %v: %v", path, err)
+		return fmt.Errorf("failed to create bind mount for %v: %v", path, err)
 	}
 	if err := unixMount(path, path, "", syscall.MS_SHARED|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("Failed to make %v rshared: %v", path, err)
+		return fmt.Errorf("failed to make %v rshared: %v", path, err)
 	}
 	return nil
 }
@@ -113,7 +115,7 @@ func MountRShared(path string) error {
 // UnmountPath unmounts the target path if it exists and is a mount path. If
 // removeTarget this will remove the previously mounted folder.
 func UnmountPath(ctx context.Context, target string, removeTarget bool) (err error) {
-	_, span := trace.StartSpan(ctx, "storage::UnmountPath")
+	_, span := oc.StartSpan(ctx, "storage::UnmountPath")
 	defer span.End()
 	defer func() { oc.SetSpanStatus(span, err) }()
 

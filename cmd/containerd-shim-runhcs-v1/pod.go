@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -5,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/Microsoft/hcsshim/internal/log"
@@ -13,10 +16,10 @@ import (
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
 	eventstypes "github.com/containerd/containerd/api/events"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/runtime"
-	"github.com/containerd/containerd/runtime/v2/task"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -37,6 +40,10 @@ type shimPod interface {
 	//
 	// If `tid` is not found, this pod MUST return `errdefs.ErrNotFound`.
 	GetTask(tid string) (shimTask, error)
+	// GetTasks returns every task in the pod.
+	//
+	// If a shim cannot be loaded, this will return an error.
+	ListTasks() ([]shimTask, error)
 	// KillTask sends `signal` to task that matches `tid`.
 	//
 	// If `tid` is not found, this pod MUST return `errdefs.ErrNotFound`.
@@ -51,9 +58,17 @@ type shimPod interface {
 	// the `shimExecStateRunning, shimExecStateExited` states. If the exec is
 	// not in this state this pod MUST return `errdefs.ErrFailedPrecondition`.
 	KillTask(ctx context.Context, tid, eid string, signal uint32, all bool) error
+	// DeleteTask removes a task from being tracked by this pod, and cleans up
+	// the resources the shim allocated for the task.
+	//
+	// The task's init exec (eid == "") must be either `shimExecStateCreated` or
+	// `shimExecStateExited`.  If the exec is not in this state this pod MUST
+	// return `errdefs.ErrFailedPrecondition`. Deleting the pod's sandbox task
+	// is a no-op.
+	DeleteTask(ctx context.Context, tid string) error
 }
 
-func createPod(ctx context.Context, events publisher, req *task.CreateTaskRequest, s *specs.Spec) (shimPod, error) {
+func createPod(ctx context.Context, events publisher, req *task.CreateTaskRequest, s *specs.Spec) (_ shimPod, err error) {
 	log.G(ctx).WithField("tid", req.ID).Debug("createPod")
 
 	if osversion.Build() < osversion.RS5 {
@@ -87,6 +102,7 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 	p := pod{
 		events: events,
 		id:     req.ID,
+		spec:   s,
 	}
 
 	var parent *uvm.UtilityVM
@@ -100,6 +116,7 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 		switch opts.(type) {
 		case *uvm.OptionsLCOW:
 			lopts = (opts).(*uvm.OptionsLCOW)
+			lopts.BundleDirectory = req.Bundle
 			parent, err = uvm.CreateLCOW(ctx, lopts)
 			if err != nil {
 				return nil, err
@@ -133,12 +150,6 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 			return nil, err
 		}
 
-		if lopts != nil {
-			err := parent.SetSecurityPolicy(ctx, lopts.SecurityPolicy)
-			if err != nil {
-				return nil, errors.Wrap(err, "unable to set security policy")
-			}
-		}
 	} else if oci.IsJobContainer(s) {
 		// If we're making a job container fake a task (i.e reuse the wcowPodSandbox logic)
 		p.sandboxTask = newWcowPodSandboxTask(ctx, events, req.ID, req.Bundle, parent, "")
@@ -229,10 +240,20 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 		}
 	} else {
 		if isWCOW {
-			// The pause container activation will immediately exit on Windows
+			defaultArgs := "c:\\windows\\system32\\cmd.exe"
+			// For the default pause image, the  entrypoint
+			// used is pause.exe
+			// If the default pause image is not used for pause containers,
+			// the activation will immediately exit on Windows
 			// because there is no command. We forcibly update the command here
-			// to keep it alive.
-			s.Process.CommandLine = "cmd /c ping -t 127.0.0.1 > nul"
+			// to keep it alive only for non-default pause images.
+			// TODO: This override can be completely removed from containerd/1.7
+			if (len(s.Process.Args) == 1 && strings.EqualFold(s.Process.Args[0], defaultArgs)) ||
+				strings.EqualFold(s.Process.CommandLine, defaultArgs) {
+				log.G(ctx).Warning("Detected CMD override for pause container entrypoint." +
+					"Please consider switching to a pause image with an explicit cmd set")
+				s.Process.CommandLine = "cmd /c ping -t 127.0.0.1 > nul"
+			}
 		}
 		// LCOW (and WCOW Process Isolated for the time being) requires a real
 		// task for the sandbox.
@@ -270,21 +291,14 @@ type pod struct {
 	// It MUST be treated as read only in the lifetime of the pod.
 	jobContainer bool
 
+	// spec is the OCI runtime specification for the pod sandbox container.
+	spec *specs.Spec
+
 	workloadTasks sync.Map
 }
 
 func (p *pod) ID() string {
 	return p.id
-}
-
-func (p *pod) GetCloneAnnotations(ctx context.Context, s *specs.Spec) (bool, string, error) {
-	isTemplate, templateID, err := oci.ParseCloneAnnotations(ctx, s)
-	if err != nil {
-		return false, "", err
-	} else if (isTemplate || templateID != "") && p.host == nil {
-		return false, "", fmt.Errorf("save as template and creating clones is only supported for hyper-v isolated containers")
-	}
-	return isTemplate, templateID, nil
 }
 
 func (p *pod) CreateTask(ctx context.Context, req *task.CreateTaskRequest, s *specs.Spec) (_ shimTask, err error) {
@@ -310,6 +324,15 @@ func (p *pod) CreateTask(ctx context.Context, req *task.CreateTaskRequest, s *sp
 		if !oci.IsJobContainer(s) {
 			return nil, errors.New("cannot create a normal process isolated container if the pod sandbox is a job container")
 		}
+		// Pass through some annotations from the pod spec that if specified will need to be made available
+		// to every container as well. Kubernetes only passes annotations to RunPodSandbox so there needs to be
+		// a way for individual containers to get access to these.
+		oci.SandboxAnnotationsPassThrough(
+			p.spec.Annotations,
+			s.Annotations,
+			annotations.HostProcessInheritUser,
+			annotations.HostProcessRootfsLocation,
+		)
 	}
 
 	ct, sid, err := oci.GetSandboxTypeAndID(s.Annotations)
@@ -333,17 +356,7 @@ func (p *pod) CreateTask(ctx context.Context, req *task.CreateTaskRequest, s *sp
 			sid)
 	}
 
-	_, templateID, err := p.GetCloneAnnotations(ctx, s)
-	if err != nil {
-		return nil, err
-	}
-
-	var st shimTask
-	if templateID != "" {
-		st, err = newClonedHcsTask(ctx, p.events, p.host, false, req, s, templateID)
-	} else {
-		st, err = newHcsTask(ctx, p.events, p.host, false, req, s)
-	}
+	st, err := newHcsTask(ctx, p.events, p.host, false, req, s)
 	if err != nil {
 		return nil, err
 	}
@@ -363,6 +376,25 @@ func (p *pod) GetTask(tid string) (shimTask, error) {
 	return raw.(shimTask), nil
 }
 
+func (p *pod) ListTasks() (_ []shimTask, err error) {
+	tasks := []shimTask{p.sandboxTask}
+	p.workloadTasks.Range(func(key, value interface{}) bool {
+		wt, loaded := value.(shimTask)
+		if !loaded {
+			err = fmt.Errorf("failed to load tasks %s", key)
+			return false
+		}
+		tasks = append(tasks, wt)
+		// Iterate all. Returning false stops the iteration. See:
+		// https://pkg.go.dev/sync#Map.Range
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
 func (p *pod) KillTask(ctx context.Context, tid, eid string, signal uint32, all bool) error {
 	t, err := p.GetTask(tid)
 	if err != nil {
@@ -380,12 +412,40 @@ func (p *pod) KillTask(ctx context.Context, tid, eid string, signal uint32, all 
 				return wt.KillExec(ctx, eid, signal, all)
 			})
 
-			// iterate all
-			return false
+			// Iterate all. Returning false stops the iteration. See:
+			// https://pkg.go.dev/sync#Map.Range
+			return true
 		})
 	}
 	eg.Go(func() error {
 		return t.KillExec(ctx, eid, signal, all)
 	})
 	return eg.Wait()
+}
+
+func (p *pod) DeleteTask(ctx context.Context, tid string) error {
+	// Deleting the sandbox task is a no-op, since the service should delete its
+	// reference to the sandbox task or pod, and `p.sandboxTask != nil` is an
+	// invariant that is relied on elsewhere.
+	// However, still get the init exec for all tasks to ensure that they have
+	// been properly stopped.
+
+	t, err := p.GetTask(tid)
+	if err != nil {
+		return errors.Wrap(err, "could not find task to delete")
+	}
+
+	e, err := t.GetExec("")
+	if err != nil {
+		return errors.Wrap(err, "could not get initial exec")
+	}
+	if e.State() == shimExecStateRunning {
+		return errors.Wrap(errdefs.ErrFailedPrecondition, "cannot delete task with running exec")
+	}
+
+	if p.id != tid {
+		p.workloadTasks.Delete(tid)
+	}
+
+	return nil
 }

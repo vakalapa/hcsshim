@@ -1,4 +1,5 @@
-// +build functional
+//go:build windows && functional
+// +build windows,functional
 
 package main
 
@@ -7,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,28 +15,29 @@ import (
 	"testing"
 
 	"github.com/Microsoft/go-winio"
-	"github.com/Microsoft/hcsshim/pkg/annotations"
-	"github.com/containerd/containerd/runtime/v2/task"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/ttrpc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
+
+	"github.com/Microsoft/hcsshim/pkg/annotations"
+
+	"github.com/Microsoft/hcsshim/test/internal/util"
+	"github.com/Microsoft/hcsshim/test/pkg/require"
 )
 
 func createStartCommand(t *testing.T) (*exec.Cmd, *bytes.Buffer, *bytes.Buffer) {
+	t.Helper()
 	return createStartCommandWithID(t, t.Name())
 }
 
 func createStartCommandWithID(t *testing.T, id string) (*exec.Cmd, *bytes.Buffer, *bytes.Buffer) {
-	bundleDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("failed to create bundle with: %v", err)
-	}
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed os.Getwd() with: %v", err)
-	}
+	t.Helper()
+	bundleDir := t.TempDir()
+
+	shim := require.BinaryInPath(t, shimExe)
 	cmd := exec.Command(
-		filepath.Join(wd, "containerd-shim-runhcs-v1.exe"),
+		shim,
 		"--namespace", t.Name(),
 		"--address", "need-a-real-one",
 		"--publish-binary", "need-a-real-one",
@@ -44,6 +45,9 @@ func createStartCommandWithID(t *testing.T, id string) (*exec.Cmd, *bytes.Buffer
 		"start",
 	)
 	cmd.Dir = bundleDir
+
+	t.Logf("execing start command: %s", cmd.String())
+
 	outb := bytes.Buffer{}
 	errb := bytes.Buffer{}
 	cmd.Stdout = &outb
@@ -52,13 +56,14 @@ func createStartCommandWithID(t *testing.T, id string) (*exec.Cmd, *bytes.Buffer
 }
 
 func cleanupTestBundle(t *testing.T, dir string) {
-	err := os.RemoveAll(dir)
-	if err != nil {
+	t.Helper()
+	if err := util.RemoveAll(dir); err != nil {
 		t.Errorf("failed removing test bundle with: %v", err)
 	}
 }
 
 func writeBundleConfig(t *testing.T, dir string, cfg *specs.Spec) {
+	t.Helper()
 	cf, err := os.Create(filepath.Join(dir, "config.json"))
 	if err != nil {
 		t.Fatalf("failed to create config.json with error: %v", err)
@@ -72,6 +77,7 @@ func writeBundleConfig(t *testing.T, dir string, cfg *specs.Spec) {
 }
 
 func verifyStartCommandSuccess(t *testing.T, expectedNamespace, expectedID string, cmd *exec.Cmd, stdout, stderr *bytes.Buffer) {
+	t.Helper()
 	err := cmd.Run()
 	if err != nil {
 		t.Fatalf("expected `start` command to succeed failed with: %v, stdout: %v, stderr: %v", err, stdout.String(), stderr.String())
@@ -99,7 +105,7 @@ func verifyStartCommandSuccess(t *testing.T, expectedNamespace, expectedID strin
 
 	cl.Close()
 	c.Close()
-	if err != nil && !strings.HasPrefix(err.Error(), "ttrpc: client shutting down: ttrpc: closed") {
+	if err != nil && !strings.HasPrefix(err.Error(), "ttrpc: closed") {
 		t.Fatalf("failed to shutdown shim with: %v", err)
 	}
 }

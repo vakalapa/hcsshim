@@ -1,25 +1,42 @@
+//go:build windows
+
 package main
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/stats"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/containerd/protobuf"
+	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func setupPodServiceWithFakes(t *testing.T) (*service, *testShimTask, *testShimTask, *testShimExec) {
+	t.Helper()
 	tid := strconv.Itoa(rand.Int())
-	s := service{
-		tid:       tid,
-		isSandbox: true,
+
+	s, err := NewService(WithTID(tid), WithIsSandbox(true))
+	if err != nil {
+		t.Fatalf("could not create service: %v", err)
 	}
+
+	// clean up the service
+	t.Cleanup(func() {
+		if _, err := s.shutdownInternal(context.Background(), &task.ShutdownRequest{
+			ID:  s.tid,
+			Now: true,
+		}); err != nil {
+			t.Fatalf("could not shutdown service: %v", err)
+		}
+	})
 
 	pod := &testShimPod{id: tid}
 
@@ -45,7 +62,7 @@ func setupPodServiceWithFakes(t *testing.T) (*service, *testShimTask, *testShimT
 	pod.tasks.Store(task.id, task)
 	pod.tasks.Store(task2.id, task2)
 	s.taskOrPod.Store(pod)
-	return &s, task, task2, task2exec2
+	return s, task, task2, task2exec2
 }
 
 func Test_PodShim_getPod_NotCreated_Error(t *testing.T) {
@@ -589,7 +606,7 @@ func Test_PodShim_updateInternal_Success(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := s.updateInternal(context.TODO(), &task.UpdateTaskRequest{ID: t1.ID(), Resources: any})
+	resp, err := s.updateInternal(context.TODO(), &task.UpdateTaskRequest{ID: t1.ID(), Resources: protobuf.FromAny(any)})
 	if err != nil {
 		t.Fatalf("should not have failed with error, got: %v", err)
 	}
@@ -607,7 +624,7 @@ func Test_PodShim_updateInternal_Error(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.updateInternal(context.TODO(), &task.UpdateTaskRequest{ID: t1.ID(), Resources: any})
+	_, err = s.updateInternal(context.TODO(), &task.UpdateTaskRequest{ID: t1.ID(), Resources: protobuf.FromAny(any)})
 	if err == nil {
 		t.Fatal("expected to get an error for incorrect resource's type")
 	}
@@ -720,6 +737,38 @@ func Test_PodShim_statsInternal_2ndTaskID_Success(t *testing.T) {
 			}
 			stats := statsI.(*stats.Statistics)
 			verifyExpectedStats(t, t2.isWCOW, false, stats)
+		})
+	}
+}
+
+func Test_PodShim_shutdownInternal(t *testing.T) {
+	for _, now := range []bool{true, false} {
+		t.Run(fmt.Sprintf("%s_Now_%t", t.Name(), now), func(t *testing.T) {
+			s, _, _, _ := setupPodServiceWithFakes(t)
+
+			if s.IsShutdown() {
+				t.Fatal("service prematurely shutdown")
+			}
+
+			_, err := s.shutdownInternal(context.Background(), &task.ShutdownRequest{
+				ID:  s.tid,
+				Now: now,
+			})
+			if err != nil {
+				t.Fatalf("could not shut down service: %v", err)
+			}
+
+			tm := time.NewTimer(5 * time.Millisecond)
+			select {
+			case <-tm.C:
+				t.Fatalf("shutdown channel did not close")
+			case <-s.Done():
+				tm.Stop()
+			}
+
+			if !s.IsShutdown() {
+				t.Fatal("service did not shutdown")
+			}
 		})
 	}
 }

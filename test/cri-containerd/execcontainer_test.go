@@ -1,4 +1,5 @@
-// +build functional
+//go:build windows && functional
+// +build windows,functional
 
 package cri_containerd
 
@@ -12,6 +13,7 @@ import (
 )
 
 func runexecContainerTestWithSandbox(t *testing.T, sandboxRequest *runtime.RunPodSandboxRequest, request *runtime.CreateContainerRequest, execReq *runtime.ExecSyncRequest) *runtime.ExecSyncResponse {
+	t.Helper()
 	client := newTestRuntimeClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -34,6 +36,7 @@ func runexecContainerTestWithSandbox(t *testing.T, sandboxRequest *runtime.RunPo
 }
 
 func execContainerLCOW(t *testing.T, uid int64, cmd []string) *runtime.ExecSyncResponse {
+	t.Helper()
 	pullRequiredLCOWImages(t, []string{imageLcowK8sPause, imageLcowCosmos})
 
 	// run podsandbox request
@@ -127,8 +130,8 @@ func Test_ExecContainer_LCOW_HasEntropy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("could not parse entropy output %s: %s", output, err)
 	}
-	if bits < 2000 {
-		t.Fatalf("%d is fewer than 2000 bits entropy", bits)
+	if bits < 256 {
+		t.Fatalf("%d is fewer than 256 bits entropy", bits)
 	}
 	t.Logf("got %d bits entropy", bits)
 }

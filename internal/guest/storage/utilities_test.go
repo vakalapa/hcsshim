@@ -1,10 +1,10 @@
+//go:build linux
 // +build linux
 
 package storage
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,16 +12,13 @@ import (
 )
 
 func Test_WaitForFileMatchingPattern_Success(t *testing.T) {
-	ctx, _ := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	testDir, err := ioutil.TempDir("", "vmbus_test")
-	if err != nil {
-		t.Fatalf("unexpected error creating temp dir %v", err)
-	}
-	defer os.RemoveAll(testDir)
+	testDir := t.TempDir()
 
 	actualPath := filepath.Join(testDir, "path1")
-	err = os.Mkdir(actualPath, 0777)
+	err := os.Mkdir(actualPath, 0777)
 	if err != nil {
 		t.Fatalf("unexpected error creating test path: %v", err)
 	}
@@ -40,13 +37,10 @@ func Test_WaitForFileMatchingPattern_Success(t *testing.T) {
 }
 
 func Test_WaitForFileMatchingPattern_Multiple_Matches(t *testing.T) {
-	ctx, _ := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	testDir, err := ioutil.TempDir("", "vmbus_test")
-	if err != nil {
-		t.Fatalf("unexpected error creating temp dir %v", err)
-	}
-	defer os.RemoveAll(testDir)
+	testDir := t.TempDir()
 
 	actualPaths := []string{"path1", "path2"}
 	for _, p := range actualPaths {
@@ -58,23 +52,20 @@ func Test_WaitForFileMatchingPattern_Multiple_Matches(t *testing.T) {
 	}
 
 	pathPattern := filepath.Join(testDir, "path*")
-	_, err = WaitForFileMatchingPattern(ctx, pathPattern)
+	_, err := WaitForFileMatchingPattern(ctx, pathPattern)
 	if err == nil {
 		t.Fatalf("expected to fail due to multiple matching files")
 	}
 }
 
 func Test_WaitForFileMatchingPattern_No_Matches(t *testing.T) {
-	ctx, _ := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	testDir, err := ioutil.TempDir("", "vmbus_test")
-	if err != nil {
-		t.Fatalf("unexpected error creating temp dir %v", err)
-	}
-	defer os.RemoveAll(testDir)
+	testDir := t.TempDir()
 
 	actualPath := filepath.Join(testDir, "path1")
-	err = os.Mkdir(actualPath, 0777)
+	err := os.Mkdir(actualPath, 0777)
 	if err != nil {
 		t.Fatalf("unexpected error creating test path: %v", err)
 	}

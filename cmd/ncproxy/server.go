@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -8,7 +10,9 @@ import (
 
 	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/hcsshim/internal/log"
+	ncproxystore "github.com/Microsoft/hcsshim/internal/ncproxy/store"
 	"github.com/Microsoft/hcsshim/internal/ncproxyttrpc"
+	ncproxygrpcv0 "github.com/Microsoft/hcsshim/pkg/ncproxy/ncproxygrpc/v0"
 	ncproxygrpc "github.com/Microsoft/hcsshim/pkg/ncproxy/ncproxygrpc/v1"
 	"github.com/Microsoft/hcsshim/pkg/octtrpc"
 	"github.com/containerd/ttrpc"
@@ -26,9 +30,13 @@ type server struct {
 
 	// store shared data on server for cleaning up later
 	// database for containerID to compute agent address
-	agentStore *computeAgentStore
+	agentStore *ncproxystore.ComputeAgentStore
 	// cache of container IDs to compute agent clients
 	cache *computeAgentCache
+
+	// database store for ncproxynetworking networks and endpoints
+	// database for network name to ncproxy networking network
+	ncproxyNetworking *ncproxystore.NetworkingStore
 }
 
 func newServer(ctx context.Context, conf *config, dbPath string) (*server, error) {
@@ -36,7 +44,7 @@ func newServer(ctx context.Context, conf *config, dbPath string) (*server, error
 	if err != nil {
 		return nil, err
 	}
-	agentStore := newComputeAgentStore(db)
+	agentStore := ncproxystore.NewComputeAgentStore(db)
 	agentCache := newComputeAgentCache()
 	reconnectComputeAgents(ctx, agentStore, agentCache)
 
@@ -46,17 +54,23 @@ func newServer(ctx context.Context, conf *config, dbPath string) (*server, error
 		return nil, err
 	}
 	return &server{
-		grpc:       grpc.NewServer(grpc.StatsHandler(&ocgrpc.ServerHandler{})),
-		ttrpc:      ttrpcServer,
-		conf:       conf,
-		agentStore: agentStore,
-		cache:      agentCache,
+		grpc:              grpc.NewServer(grpc.StatsHandler(&ocgrpc.ServerHandler{})),
+		ttrpc:             ttrpcServer,
+		conf:              conf,
+		agentStore:        agentStore,
+		cache:             agentCache,
+		ncproxyNetworking: ncproxystore.NewNetworkingStore(db),
 	}, nil
 }
 
 func (s *server) setup(ctx context.Context) (net.Listener, net.Listener, error) {
-	gService := newGRPCService(s.cache)
+	gService := newGRPCService(s.cache, s.ncproxyNetworking)
 	ncproxygrpc.RegisterNetworkConfigProxyServer(s.grpc, gService)
+
+	// support the v0 ncproxy api
+	v0Wrapper := newV0ServiceWrapper(gService)
+	ncproxygrpcv0.RegisterNetworkConfigProxyServer(s.grpc, v0Wrapper)
+	log.G(ctx).Warnf("ncproxygprc api v0 is deprecated, please use ncproxygrpc api v1")
 
 	tService := newTTRPCService(ctx, s.cache, s.agentStore)
 	ncproxyttrpc.RegisterNetworkConfigProxyService(s.ttrpc, tService)
@@ -90,6 +104,9 @@ func (s *server) cleanupResources(ctx context.Context) {
 	}
 	if err := s.agentStore.Close(); err != nil {
 		log.G(ctx).WithError(err).Error("failed to close ncproxy compute agent database")
+	}
+	if err := s.ncproxyNetworking.Close(); err != nil {
+		log.G(ctx).WithError(err).Error("failed to close ncproxy networking database")
 	}
 }
 
@@ -135,20 +152,20 @@ func (s *server) serve(ctx context.Context, ttrpcListener net.Listener, grpcList
 //
 // There are a few failure modes for reconnect:
 //
-// 1. If a compute agent entry is stale, connecting to the compute agent client will fail
-//    and we will remove the entry from the database.
+//  1. If a compute agent entry is stale, connecting to the compute agent client will fail
+//     and we will remove the entry from the database.
 //
-// 2. If an active compute agent exists but we fail to connect to it, we will again remove
-//    the entry from the database. In this case, it is the node network service's
-//    responsibility to cleanup host network resources that are no longer being used.
+//  2. If an active compute agent exists but we fail to connect to it, we will again remove
+//     the entry from the database. In this case, it is the node network service's
+//     responsibility to cleanup host network resources that are no longer being used.
 //
 // Other failure modes are possible but not expected. In all failure cases we log the failures
 // but allow the service start to proceed. We chose this approach vs just failing service
 // start to avoid blocking service for all containers that had successful reconnection and to
 // avoid blocking the creation of new containers until retry or mitigation.
-func reconnectComputeAgents(ctx context.Context, agentStore *computeAgentStore, agentCache *computeAgentCache) {
-	computeAgentMap, err := agentStore.getComputeAgents(ctx)
-	if err != nil && errors.Is(err, errBucketNotFound) {
+func reconnectComputeAgents(ctx context.Context, agentStore *ncproxystore.ComputeAgentStore, agentCache *computeAgentCache) {
+	computeAgentMap, err := agentStore.GetComputeAgents(ctx)
+	if err != nil && errors.Is(err, ncproxystore.ErrBucketNotFound) {
 		// no entries in the database yet, return early
 		log.G(ctx).WithError(err).Debug("no entries in database")
 		return
@@ -165,7 +182,7 @@ func reconnectComputeAgents(ctx context.Context, agentStore *computeAgentStore, 
 			if err != nil {
 				// can't connect to compute agent, remove entry in database
 				log.G(ctx).WithField("agentAddress", agentAddress).WithError(err).Error("failed to create new compute agent client")
-				dErr := agentStore.deleteComputeAgent(ctx, containerID)
+				dErr := agentStore.DeleteComputeAgent(ctx, containerID)
 				if dErr != nil {
 					log.G(ctx).WithField("key", containerID).WithError(dErr).Warn("failed to delete key from compute agent store")
 				}

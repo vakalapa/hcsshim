@@ -1,25 +1,47 @@
+//go:build windows
+
 package main
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/stats"
+	"github.com/Microsoft/hcsshim/internal/hcsoci"
+	"github.com/Microsoft/hcsshim/pkg/ctrdtaskapi"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/containerd/protobuf"
+	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func setupTaskServiceWithFakes(t *testing.T) (*service, *testShimTask, *testShimExec) {
+	t.Helper()
 	tid := strconv.Itoa(rand.Int())
-	s := service{
-		tid:       tid,
-		isSandbox: false,
+
+	s, err := NewService(WithTID(tid), WithIsSandbox(false))
+	if err != nil {
+		t.Fatalf("could not create service: %v", err)
 	}
+
+	// clean up the service
+	t.Cleanup(func() {
+		if _, err := s.shutdownInternal(context.Background(), &task.ShutdownRequest{
+			ID:  s.tid,
+			Now: true,
+		}); err != nil {
+			t.Fatalf("could not shutdown service: %v", err)
+		}
+	})
+
 	task := &testShimTask{
 		id:    tid,
 		exec:  newTestShimExec(tid, tid, 10),
@@ -29,7 +51,7 @@ func setupTaskServiceWithFakes(t *testing.T) (*service, *testShimTask, *testShim
 	secondExec := newTestShimExec(tid, secondExecID, 101)
 	task.execs[secondExecID] = secondExec
 	s.taskOrPod.Store(task)
-	return &s, task, secondExec
+	return s, task, secondExec
 }
 
 func Test_TaskShim_getTask_NotCreated_Error(t *testing.T) {
@@ -509,12 +531,73 @@ func Test_TaskShim_updateInternal_Success(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := s.updateInternal(context.TODO(), &task.UpdateTaskRequest{ID: t1.ID(), Resources: any})
+	resp, err := s.updateInternal(context.TODO(), &task.UpdateTaskRequest{ID: t1.ID(), Resources: protobuf.FromAny(any)})
 	if err != nil {
 		t.Fatalf("should not have failed with error, got: %v", err)
 	}
 	if resp == nil {
 		t.Fatalf("should have returned an empty resp")
+	}
+}
+
+// Tests if a requested mount is valid for windows containers.
+// Currently only host volumes/directories are supported to be mounted
+// on a running windows container.
+func Test_TaskShimWindowsMount_updateInternal_Success(t *testing.T) {
+	s, t1, _ := setupTaskServiceWithFakes(t)
+	t1.isWCOW = true
+
+	hostRWSharedDirectory := t.TempDir()
+	fRW, _ := os.OpenFile(filepath.Join(hostRWSharedDirectory, "readwrite"), os.O_RDWR|os.O_CREATE, 0755)
+	fRW.Close()
+
+	resources := &ctrdtaskapi.ContainerMount{
+		HostPath:      hostRWSharedDirectory,
+		ContainerPath: hostRWSharedDirectory,
+		ReadOnly:      true,
+		Type:          "",
+	}
+	any, err := typeurl.MarshalAny(resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := s.updateInternal(context.TODO(), &task.UpdateTaskRequest{ID: t1.ID(), Resources: protobuf.FromAny(any)})
+	if err != nil {
+		t.Fatalf("should not have failed update mount with error, got: %v", err)
+	}
+	if resp == nil {
+		t.Fatalf("should have returned an empty resp")
+	}
+}
+
+func Test_TaskShimWindowsMount_updateInternal_Error(t *testing.T) {
+	s, t1, _ := setupTaskServiceWithFakes(t)
+	t1.isWCOW = true
+
+	hostRWSharedDirectory := t.TempDir()
+	tmpVhdPath := filepath.Join(hostRWSharedDirectory, "test-vhd.vhdx")
+
+	fRW, _ := os.OpenFile(filepath.Join(tmpVhdPath, "readwrite"), os.O_RDWR|os.O_CREATE, 0755)
+	fRW.Close()
+
+	resources := &ctrdtaskapi.ContainerMount{
+		HostPath:      tmpVhdPath,
+		ContainerPath: tmpVhdPath,
+		ReadOnly:      true,
+		Type:          hcsoci.MountTypeVirtualDisk,
+	}
+	any, err := typeurl.MarshalAny(resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := s.updateInternal(context.TODO(), &task.UpdateTaskRequest{ID: t1.ID(), Resources: protobuf.FromAny(any)})
+	if err == nil {
+		t.Fatalf("should have failed update mount with error")
+	}
+	if resp != nil {
+		t.Fatalf("should have returned a nil resp, got: %v", resp)
 	}
 }
 
@@ -528,7 +611,7 @@ func Test_TaskShim_updateInternal_Error(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = s.updateInternal(context.TODO(), &task.UpdateTaskRequest{ID: t1.ID(), Resources: any})
+	_, err = s.updateInternal(context.TODO(), &task.UpdateTaskRequest{ID: t1.ID(), Resources: protobuf.FromAny(any)})
 	if err == nil {
 		t.Fatal("expected to get an error for incorrect resource's type")
 	}
@@ -595,7 +678,7 @@ func Test_TaskShim_waitInternal_InitTaskID_2ndExecID_Success(t *testing.T) {
 	}
 }
 
-func Test_TaskShim_statsInternal_InitTaskID_Sucess(t *testing.T) {
+func Test_TaskShim_statsInternal_InitTaskID_Success(t *testing.T) {
 	testNames := []string{"WCOW", "LCOW"}
 	for i, isWCOW := range []bool{true, false} {
 		t.Run(testNames[i], func(t *testing.T) {
@@ -616,6 +699,38 @@ func Test_TaskShim_statsInternal_InitTaskID_Sucess(t *testing.T) {
 			}
 			stats := statsI.(*stats.Statistics)
 			verifyExpectedStats(t, t1.isWCOW, true, stats)
+		})
+	}
+}
+
+func Test_TaskShim_shutdownInternal(t *testing.T) {
+	for _, now := range []bool{true, false} {
+		t.Run(fmt.Sprintf("%s_Now_%t", t.Name(), now), func(t *testing.T) {
+			s, _, _ := setupTaskServiceWithFakes(t)
+
+			if s.IsShutdown() {
+				t.Fatal("service prematurely shutdown")
+			}
+
+			_, err := s.shutdownInternal(context.Background(), &task.ShutdownRequest{
+				ID:  s.tid,
+				Now: now,
+			})
+			if err != nil {
+				t.Fatalf("could not shut down service: %v", err)
+			}
+
+			tm := time.NewTimer(5 * time.Millisecond)
+			select {
+			case <-tm.C:
+				t.Fatalf("shutdown channel did not close")
+			case <-s.Done():
+				tm.Stop()
+			}
+
+			if !s.IsShutdown() {
+				t.Fatal("service did not shutdown")
+			}
 		})
 	}
 }

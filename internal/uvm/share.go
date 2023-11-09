@@ -1,3 +1,5 @@
+//go:build windows
+
 package uvm
 
 import (
@@ -6,33 +8,43 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/Microsoft/hcsshim/internal/guestrequest"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
-	"github.com/Microsoft/hcsshim/internal/requesttype"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
+	"github.com/pkg/errors"
 )
+
+func (uvm *UtilityVM) AddVsmbAndGetSharePath(ctx context.Context, reqHostPath, reqUVMPath string, readOnly bool) (*VSMBShare, string, error) {
+	options := uvm.DefaultVSMBOptions(readOnly)
+	vsmbShare, err := uvm.AddVSMB(ctx, reqHostPath, options)
+	if err != nil {
+		return nil, "", errors.Wrapf(err, "failed to add mount as vSMB share to UVM")
+	}
+	defer func() {
+		if err != nil {
+			_ = vsmbShare.Release(ctx)
+		}
+	}()
+
+	sharePath, err := uvm.GetVSMBUvmPath(ctx, reqHostPath, readOnly)
+	if err != nil {
+		return nil, "", errors.Wrapf(err, "failed to get vsmb path")
+	}
+
+	return vsmbShare, sharePath, nil
+}
 
 // Share shares in file(s) from `reqHostPath` on the host machine to `reqUVMPath` inside the UVM.
 // This function handles both LCOW and WCOW scenarios.
 func (uvm *UtilityVM) Share(ctx context.Context, reqHostPath, reqUVMPath string, readOnly bool) (err error) {
 	if uvm.OS() == "windows" {
-		options := uvm.DefaultVSMBOptions(readOnly)
-		vsmbShare, err := uvm.AddVSMB(ctx, reqHostPath, options)
+		_, sharePath, err := uvm.AddVsmbAndGetSharePath(ctx, reqHostPath, reqUVMPath, readOnly)
 		if err != nil {
 			return err
 		}
-		defer func() {
-			if err != nil {
-				_ = vsmbShare.Release(ctx)
-			}
-		}()
-
-		sharePath, err := uvm.GetVSMBUvmPath(ctx, reqHostPath, readOnly)
-		if err != nil {
-			return err
-		}
-		guestReq := guestrequest.GuestRequest{
-			ResourceType: guestrequest.ResourceTypeMappedDirectory,
-			RequestType:  requesttype.Add,
+		guestReq := guestrequest.ModificationRequest{
+			ResourceType: guestresource.ResourceTypeMappedDirectory,
+			RequestType:  guestrequest.RequestTypeAdd,
 			Settings: &hcsschema.MappedDirectory{
 				HostPath:      sharePath,
 				ContainerPath: reqUVMPath,

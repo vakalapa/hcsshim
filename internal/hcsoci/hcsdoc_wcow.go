@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package hcsoci
@@ -6,10 +7,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/Microsoft/go-winio/pkg/fs"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
+
+	"github.com/Microsoft/hcsshim/internal/guestpath"
 	"github.com/Microsoft/hcsshim/internal/hcs/schema1"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/layers"
@@ -21,9 +29,9 @@ import (
 	"github.com/Microsoft/hcsshim/internal/wclayer"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/sirupsen/logrus"
 )
+
+const createContainerSubdirectoryForProcessDumpSuffix = "{container_id}"
 
 // A simple wrapper struct around the container mount configs that should be added to the
 // container.
@@ -39,7 +47,6 @@ func createMountsConfig(ctx context.Context, coi *createOptionsInternal) (*mount
 	// TODO: Mapped pipes to add in v2 schema.
 	var config mountsConfig
 	for _, mount := range coi.Spec.Mounts {
-
 		if uvm.IsPipe(mount.Source) {
 			src, dst := uvm.GetContainerPipeMapping(coi.HostingSystem, mount)
 			config.mpsv1 = append(config.mpsv1, schema1.MappedPipe{HostPath: src, ContainerPipeName: dst})
@@ -58,26 +65,16 @@ func createMountsConfig(ctx context.Context, coi *createOptionsInternal) (*mount
 				// if the path includes a symlink. Therefore, we resolve the path here before
 				// passing it in. The issue does not occur with VSMB, so don't need to worry
 				// about the isolated case.
-				src, err := filepath.EvalSymlinks(mount.Source)
+				src, err := fs.ResolvePath(mount.Source)
 				if err != nil {
-					return nil, fmt.Errorf("failed to eval symlinks for mount source %q: %s", mount.Source, err)
+					return nil, fmt.Errorf("failed to resolve path for mount source %q: %s", mount.Source, err)
 				}
 				mdv2.HostPath = src
-			} else if mount.Type == "virtual-disk" || mount.Type == "physical-disk" || mount.Type == "extensible-virtual-disk" {
-				mountPath := mount.Source
-				var err error
-				if mount.Type == "extensible-virtual-disk" {
-					_, mountPath, err = uvm.ParseExtensibleVirtualDiskPath(mount.Source)
-					if err != nil {
-						return nil, err
-					}
-				}
-				uvmPath, err := coi.HostingSystem.GetScsiUvmPath(ctx, mountPath)
-				if err != nil {
-					return nil, err
-				}
-				mdv2.HostPath = uvmPath
-			} else if strings.HasPrefix(mount.Source, "sandbox://") {
+			} else if mount.Type == MountTypeVirtualDisk || mount.Type == MountTypePhysicalDisk || mount.Type == MountTypeExtensibleVirtualDisk {
+				// For v2 schema containers, any disk mounts will be part of coi.additionalMounts.
+				// For v1 schema containers, we don't even get here, since there is no HostingSystem.
+				continue
+			} else if strings.HasPrefix(mount.Source, guestpath.SandboxMountPrefix) {
 				// Convert to the path in the guest that was asked for.
 				mdv2.HostPath = convertToWCOWSandboxMountPath(mount.Source)
 			} else {
@@ -92,6 +89,7 @@ func createMountsConfig(ctx context.Context, coi *createOptionsInternal) (*mount
 			config.mdsv2 = append(config.mdsv2, mdv2)
 		}
 	}
+	config.mdsv2 = append(config.mdsv2, coi.windowsAdditionalMounts...)
 	return &config, nil
 }
 
@@ -271,13 +269,7 @@ func createWindowsContainerDocument(ctx context.Context, coi *createOptionsInter
 
 		v1.EndpointList = coi.Spec.Windows.Network.EndpointList
 
-		// Use the reserved network namespace for containers created inside
-		// cloned or template UVMs.
-		if coi.HostingSystem != nil && (coi.HostingSystem.IsTemplate || coi.HostingSystem.IsClone) {
-			v2Container.Networking.Namespace = uvm.DefaultCloneNetworkNamespaceID
-		} else {
-			v2Container.Networking.Namespace = coi.actualNetworkNamespace
-		}
+		v2Container.Networking.Namespace = coi.actualNetworkNamespace
 
 		v1.AllowUnqualifiedDNSQuery = coi.Spec.Windows.Network.AllowUnqualifiedDNSQuery
 		v2Container.Networking.AllowUnqualifiedDnsQuery = v1.AllowUnqualifiedDNSQuery
@@ -400,38 +392,89 @@ func createWindowsContainerDocument(ctx context.Context, coi *createOptionsInter
 		dumpPath = specDumpPath
 	}
 
+	// Servercore images block on signaling and wait until the target process
+	// is terminated to return to its caller. By default, servercore waits for
+	// 5 seconds (default value of 'WaitToKillServiceTimeout') before sending
+	// a SIGKILL to terminate the process. This causes issues when graceful
+	// termination of containers is requested (Bug36689012).
+	// The regkey 'WaitToKillServiceTimeout' value is overridden here to help
+	// honor graceful termination of containers by waiting for the requested
+	// amount of time before stopping the container.
+	// More details on the implementation of this fix can be found in the Kill()
+	// function of exec_hcs.go
+
+	// 'WaitToKillServiceTimeout' reg key value is arbitrarily chosen and set to a
+	// value that is long enough that no one will want to wait longer
+	registryAdd := []hcsschema.RegistryValue{
+		{
+			Key: &hcsschema.RegistryKey{
+				Hive: "System",
+				Name: "ControlSet001\\Control",
+			},
+			Name:        "WaitToKillServiceTimeout",
+			StringValue: strconv.Itoa(math.MaxInt32),
+			Type_:       "String",
+		},
+	}
+
 	if dumpPath != "" {
+		//  If dumpPath specified has createContainerSubdirectoryForProcessDumpSuffix substring
+		// specified as a suffix, then create subdirectory for this container at the specified
+		// dumpPath location. When a fileshare from the host is mounted to the specified dumpPath,
+		// this behavior will help identify dumps coming from differnet containers in the pod.
+		// Check for createContainerSubdirectoryForProcessDumpSuffix in lower case and upper case
+		if strings.HasSuffix(dumpPath, createContainerSubdirectoryForProcessDumpSuffix) {
+			// replace {container_id} with the actual container id
+			dumpPath = strings.TrimSuffix(dumpPath, createContainerSubdirectoryForProcessDumpSuffix) + coi.ID
+		} else if strings.HasSuffix(dumpPath, strings.ToUpper(createContainerSubdirectoryForProcessDumpSuffix)) {
+			// replace {CONTAINER_ID} with the actual container id
+			dumpPath = strings.TrimSuffix(dumpPath, strings.ToUpper(createContainerSubdirectoryForProcessDumpSuffix)) + coi.ID
+		}
 		dumpType, err := parseDumpType(coi.Spec.Annotations)
+		if err != nil {
+			return nil, nil, err
+		}
+		dumpCount, err := parseDumpCount(coi.Spec.Annotations)
 		if err != nil {
 			return nil, nil, err
 		}
 
 		// Setup WER registry keys for local process dump creation if specified.
 		// https://docs.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps
-		v2Container.RegistryChanges = &hcsschema.RegistryChanges{
-			AddValues: []hcsschema.RegistryValue{
-				{
-					Key: &hcsschema.RegistryKey{
-						Hive: "Software",
-						Name: "Microsoft\\Windows\\Windows Error Reporting\\LocalDumps",
-					},
-					Name:        "DumpFolder",
-					StringValue: dumpPath,
-					Type_:       "String",
+		registryAdd = append(registryAdd, []hcsschema.RegistryValue{
+			{
+				Key: &hcsschema.RegistryKey{
+					Hive: "Software",
+					Name: "Microsoft\\Windows\\Windows Error Reporting\\LocalDumps",
 				},
-				{
-					Key: &hcsschema.RegistryKey{
-						Hive: "Software",
-						Name: "Microsoft\\Windows\\Windows Error Reporting\\LocalDumps",
-					},
-					Name:       "DumpType",
-					DWordValue: dumpType,
-					Type_:      "DWord",
-				},
+				Name:        "DumpFolder",
+				StringValue: dumpPath,
+				Type_:       "String",
 			},
-		}
+			{
+				Key: &hcsschema.RegistryKey{
+					Hive: "Software",
+					Name: "Microsoft\\Windows\\Windows Error Reporting\\LocalDumps",
+				},
+				Name:       "DumpType",
+				DWordValue: dumpType,
+				Type_:      "DWord",
+			},
+			{
+				Key: &hcsschema.RegistryKey{
+					Hive: "Software",
+					Name: "Microsoft\\Windows\\Windows Error Reporting\\LocalDumps",
+				},
+				Name:       "DumpCount",
+				DWordValue: dumpCount,
+				Type_:      "DWord",
+			},
+		}...)
 	}
 
+	v2Container.RegistryChanges = &hcsschema.RegistryChanges{
+		AddValues: registryAdd,
+	}
 	return v1, v2Container, nil
 }
 
@@ -461,6 +504,23 @@ func parseAssignedDevices(ctx context.Context, coi *createOptionsInternal, v2 *h
 	}
 	v2.AssignedDevices = v2AssignedDevices
 	return nil
+}
+
+func parseDumpCount(annots map[string]string) (int32, error) {
+	dmpCountStr := annots[annotations.WCOWProcessDumpCount]
+	if dmpCountStr == "" {
+		// If no count is specified, default of 10 is set.
+		return 10, nil
+	}
+
+	dumpCount, err := strconv.Atoi(dmpCountStr)
+	if err != nil {
+		return -1, err
+	}
+	if dumpCount > 0 {
+		return int32(dumpCount), nil
+	}
+	return -1, fmt.Errorf("invaid dump count specified: %v", dmpCountStr)
 }
 
 // parseDumpType parses the passed in string representation of the local user mode process dump type to the

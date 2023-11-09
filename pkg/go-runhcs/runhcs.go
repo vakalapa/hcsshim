@@ -1,8 +1,11 @@
+//go:build windows
+
 package runhcs
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,7 +23,7 @@ type Format string
 
 const (
 	none Format = ""
-	// Text is the default text log ouput.
+	// Text is the default text log output.
 	Text Format = "text"
 	// JSON is the JSON formatted log output.
 	JSON Format = "json"
@@ -34,6 +37,11 @@ func getCommandPath() string {
 	pathi := runhcsPath.Load()
 	if pathi == nil {
 		path, err := exec.LookPath(command)
+		if err != nil {
+			if errors.Is(err, exec.ErrDot) {
+				err = nil
+			}
+		}
 		if err != nil {
 			// LookPath only finds current directory matches based on the
 			// callers current directory but the caller is not likely in the
@@ -140,7 +148,7 @@ func (r *Runhcs) runOrError(cmd *exec.Cmd) error {
 		}
 		status, err := runc.Monitor.Wait(cmd, ec)
 		if err == nil && status != 0 {
-			err = fmt.Errorf("%s did not terminate sucessfully", cmd.Args[0])
+			err = fmt.Errorf("%s did not terminate successfully", cmd.Args[0])
 		}
 		return err
 	}
@@ -166,7 +174,7 @@ func cmdOutput(cmd *exec.Cmd, combined bool) ([]byte, error) {
 
 	status, err := runc.Monitor.Wait(cmd, ec)
 	if err == nil && status != 0 {
-		err = fmt.Errorf("%s did not terminate sucessfully", cmd.Args[0])
+		err = fmt.Errorf("%s did not terminate successfully", cmd.Args[0])
 	}
 
 	return b.Bytes(), err

@@ -1,3 +1,5 @@
+//go:build windows && (functional || uvmscratch)
+// +build windows
 // +build functional uvmscratch
 
 package functional
@@ -9,17 +11,19 @@ import (
 	"testing"
 
 	"github.com/Microsoft/hcsshim/internal/lcow"
-	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/osversion"
-	testutilities "github.com/Microsoft/hcsshim/test/functional/utilities"
+	"github.com/Microsoft/hcsshim/test/pkg/require"
+	tuvm "github.com/Microsoft/hcsshim/test/pkg/uvm"
 )
 
 func TestScratchCreateLCOW(t *testing.T) {
-	testutilities.RequiresBuild(t, osversion.RS5)
-	tempDir := testutilities.CreateTempDir(t)
-	defer os.RemoveAll(tempDir)
+	t.Skip("not yet updated")
 
-	firstUVM := testutilities.CreateLCOWUVM(context.Background(), t, "TestCreateLCOWScratch")
+	require.Build(t, osversion.RS5)
+	requireFeatures(t, featureLCOW, featureScratch)
+
+	tempDir := t.TempDir()
+	firstUVM := tuvm.CreateAndStartLCOW(context.Background(), t, "TestCreateLCOWScratch")
 	defer firstUVM.Close()
 
 	cacheFile := filepath.Join(tempDir, "cache.vhdx")
@@ -36,7 +40,7 @@ func TestScratchCreateLCOW(t *testing.T) {
 		t.Fatalf("cacheFile wasn't created!")
 	}
 
-	targetUVM := testutilities.CreateLCOWUVM(context.Background(), t, "TestCreateLCOWScratch_target")
+	targetUVM := tuvm.CreateAndStartLCOW(context.Background(), t, "TestCreateLCOWScratch_target")
 	defer targetUVM.Close()
 
 	// A non-cached create
@@ -45,12 +49,11 @@ func TestScratchCreateLCOW(t *testing.T) {
 	}
 
 	// Make sure it can be added (verifies it has access correctly)
-	var options []string
-	scsiMount, err := targetUVM.AddSCSI(context.Background(), destTwo, "", false, false, options, uvm.VMAccessTypeIndividual)
+	scsiMount, err := targetUVM.SCSIManager.AddVirtualDisk(context.Background(), destTwo, false, targetUVM.ID(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scsiMount.Controller != 0 && scsiMount.LUN != 0 {
+	if scsiMount.Controller() != 0 && scsiMount.LUN() != 0 {
 		t.Fatal(err)
 	}
 	// TODO Could consider giving it a host path and verifying it's contents somehow

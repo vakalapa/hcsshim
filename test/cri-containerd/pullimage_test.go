@@ -1,4 +1,5 @@
-// +build functional
+//go:build windows && functional
+// +build windows,functional
 
 package cri_containerd
 
@@ -18,6 +19,7 @@ const (
 	testLinkName                    = "fakelink"
 	testDirPath                     = "C:\\Users\\Public"
 	imageWindowsNanoserverTestImage = "cplatpublic.azurecr.io/timestamp:latest"
+	imageLinuxUnorderedTar          = "cplatpublic.azurecr.io/unordered_tar_image:latest"
 )
 
 func Test_PullImageTimestamps(t *testing.T) {
@@ -65,13 +67,13 @@ func Test_PullImageTimestamps(t *testing.T) {
 		testDirPath,
 	}
 
-	containerId := createContainerInSandbox(t, client, ctx, podID, t.Name()+"-Container", imageWindowsNanoserverTestImage, command, nil, nil, sandboxRequest.Config)
-	defer removeContainer(t, client, ctx, containerId)
+	containerID := createContainerInSandbox(t, client, ctx, podID, t.Name()+"-Container", imageWindowsNanoserverTestImage, command, nil, nil, sandboxRequest.Config)
+	defer removeContainer(t, client, ctx, containerID)
 
-	startContainer(t, client, ctx, containerId)
-	defer stopContainer(t, client, ctx, containerId)
+	startContainer(t, client, ctx, containerID)
+	defer stopContainer(t, client, ctx, containerID)
 
-	output, errorMsg, exitCode := execContainer(t, client, ctx, containerId, execCommand)
+	output, errorMsg, exitCode := execContainer(t, client, ctx, containerID, execCommand)
 
 	if exitCode != 0 || len(errorMsg) > 0 {
 		t.Fatalf("Failed to exec inside container: %s, exitcode: %v\n",
@@ -101,4 +103,12 @@ func Test_PullImageTimestamps(t *testing.T) {
 	if startTimestamp.Before(testdirTimestamp) || startTimestamp.Before(fakelinkTimestamp) {
 		t.Fatalf("Timestamps not in order. startTimestamp should be less than testdirTimestamp and fakelinkTimestamp")
 	}
+}
+
+func Test_PullImageUnorderedTar(t *testing.T) {
+	requireFeatures(t, featureLCOW)
+
+	// This is a very minimal hand crafted image so it can't run a container.  We just
+	// want to test if pulling this image succeeds.
+	pullRequiredLCOWImages(t, []string{imageLinuxUnorderedTar})
 }

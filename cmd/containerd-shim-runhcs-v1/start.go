@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -5,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,8 +14,8 @@ import (
 	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/hcsshim/internal/oci"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
+	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/runtime/v2/shim"
-	"github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/ttrpc"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -35,7 +36,7 @@ The start command can either start a new shim or return an address to an existin
 	SkipArgReorder: true,
 	Action: func(context *cli.Context) (err error) {
 		// We cant write anything to stdout/stderr for this cmd.
-		logrus.SetOutput(ioutil.Discard)
+		logrus.SetOutput(io.Discard)
 
 		// On Windows there are two scenarios that will launch a shim.
 		//

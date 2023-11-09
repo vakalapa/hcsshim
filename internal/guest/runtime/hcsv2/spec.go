@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package hcsv2
@@ -9,12 +10,18 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Microsoft/hcsshim/internal/log"
-	"github.com/Microsoft/hcsshim/pkg/annotations"
+	int_oci "github.com/Microsoft/hcsshim/internal/oci"
 	"github.com/opencontainers/runc/libcontainer/devices"
 	"github.com/opencontainers/runc/libcontainer/user"
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+
+	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/pkg/annotations"
+)
+
+const (
+	devShmPath = "/dev/shm"
 )
 
 // getNetworkNamespaceID returns the `ToLower` of
@@ -31,17 +38,6 @@ func getNetworkNamespaceID(spec *oci.Spec) string {
 func isRootReadonly(spec *oci.Spec) bool {
 	if spec.Root != nil {
 		return spec.Root.Readonly
-	}
-	return false
-}
-
-// isInMounts returns `true` if `target` matches a `Destination` in any of
-// `mounts`.
-func isInMounts(target string, mounts []oci.Mount) bool {
-	for _, m := range mounts {
-		if m.Destination == target {
-			return true
-		}
 	}
 	return false
 }
@@ -199,29 +195,17 @@ func getGroup(spec *oci.Spec, filter func(user.Group) bool) (user.Group, error) 
 func applyAnnotationsToSpec(ctx context.Context, spec *oci.Spec) error {
 	// Check if we need to override container's /dev/shm
 	if val, ok := spec.Annotations[annotations.LCOWDevShmSizeInKb]; ok {
-		sz, err := strconv.ParseInt(val, 10, 64)
+		mt, err := devShmMountWithSize(val)
 		if err != nil {
-			return errors.Wrap(err, "/dev/shm size must be a valid integer")
+			return err
 		}
-		if sz <= 0 {
-			return errors.Errorf("/dev/shm size must be a positive integer, got: %d", sz)
-		}
-
-		// Use the same options as in upstream https://github.com/containerd/containerd/blob/0def98e462706286e6eaeff4a90be22fda75e761/oci/mounts.go#L49
-		size := fmt.Sprintf("size=%dk", sz)
-		mt := oci.Mount{
-			Destination: "/dev/shm",
-			Type:        "tmpfs",
-			Source:      "shm",
-			Options:     []string{"nosuid", "noexec", "nodev", "mode=1777", size},
-		}
-		spec.Mounts = removeMount("/dev/shm", spec.Mounts)
-		spec.Mounts = append(spec.Mounts, mt)
-		log.G(ctx).WithField("size", size).Debug("set custom /dev/shm size")
+		spec.Mounts = removeMount(devShmPath, spec.Mounts)
+		spec.Mounts = append(spec.Mounts, *mt)
+		log.G(ctx).WithField("sizeKB", val).Debug("set custom /dev/shm size")
 	}
 
 	// Check if we need to do any capability/device mappings
-	if spec.Annotations[annotations.LCOWPrivileged] == "true" {
+	if int_oci.ParseAnnotationsBool(ctx, spec.Annotations, annotations.LCOWPrivileged, false) {
 		log.G(ctx).Debugf("'%s' set for privileged container", annotations.LCOWPrivileged)
 
 		// Add all host devices
@@ -255,18 +239,41 @@ func applyAnnotationsToSpec(ctx context.Context, spec *oci.Spec) error {
 	return nil
 }
 
-// Helper function to create an oci prestart hook to run ldconfig
-func addLDConfigHook(ctx context.Context, spec *oci.Spec, args, env []string) error {
-	if spec.Hooks == nil {
-		spec.Hooks = &oci.Hooks{}
+// addDevSev adds SEV device to container spec. On 5.x kernel the device is /dev/sev,
+// however this changed in 6.x where the device is /dev/sev-guest.
+func addDevSev(ctx context.Context, spec *oci.Spec) error {
+	// try adding /dev/sev, which should be present for 5.x kernel
+	devSev, err := devices.DeviceFromPath("/dev/sev", "rwm")
+	if err != nil {
+		// try adding /dev/guest-sev, which should be present for 6.x kernel
+		sevErr := fmt.Errorf("failed to add SEV device to spec: %w", err)
+		var errSevGuest error
+		devSev, errSevGuest = devices.DeviceFromPath("/dev/sev-guest", "rwm")
+		if errSevGuest != nil {
+			return fmt.Errorf("%s: %w", sevErr, errSevGuest)
+		}
 	}
-
-	ldConfigHook := oci.Hook{
-		Path: "/sbin/ldconfig",
-		Args: args,
-		Env:  env,
-	}
-
-	spec.Hooks.Prestart = append(spec.Hooks.Prestart, ldConfigHook)
+	addLinuxDeviceToSpec(ctx, devSev, spec, true)
 	return nil
+}
+
+// devShmMountWithSize returns a /dev/shm device mount with size set to
+// `sizeString` if it represents a valid size in KB, returns error otherwise.
+func devShmMountWithSize(sizeString string) (*oci.Mount, error) {
+	size, err := strconv.ParseUint(sizeString, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("/dev/shm size must be a valid integer: %w", err)
+	}
+	if size == 0 {
+		return nil, errors.New("/dev/shm size must be non-zero")
+	}
+
+	// Use the same options as in upstream https://github.com/containerd/containerd/blob/0def98e462706286e6eaeff4a90be22fda75e761/oci/mounts.go#L49
+	sizeKB := fmt.Sprintf("size=%sk", sizeString)
+	return &oci.Mount{
+		Source:      "shm",
+		Destination: devShmPath,
+		Type:        "tmpfs",
+		Options:     []string{"nosuid", "noexec", "nodev", "mode=1777", sizeKB},
+	}, nil
 }

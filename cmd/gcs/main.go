@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package main
@@ -6,26 +7,30 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
+	cgroups "github.com/containerd/cgroups/v3/cgroup1"
+	cgroupstats "github.com/containerd/cgroups/v3/cgroup1/stats"
+	oci "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"go.opencensus.io/trace"
+
 	"github.com/Microsoft/hcsshim/internal/guest/bridge"
 	"github.com/Microsoft/hcsshim/internal/guest/kmsg"
 	"github.com/Microsoft/hcsshim/internal/guest/runtime/hcsv2"
 	"github.com/Microsoft/hcsshim/internal/guest/runtime/runc"
 	"github.com/Microsoft/hcsshim/internal/guest/transport"
+	"github.com/Microsoft/hcsshim/internal/guestpath"
+	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/oc"
-	"github.com/cenkalti/backoff/v4"
-	"github.com/containerd/cgroups"
-	cgroupstats "github.com/containerd/cgroups/stats/v1"
-	oci "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"go.opencensus.io/trace"
+	"github.com/Microsoft/hcsshim/internal/version"
+	"github.com/Microsoft/hcsshim/pkg/securitypolicy"
 )
 
 func memoryLogFormat(metrics *cgroupstats.Metrics) logrus.Fields {
@@ -106,7 +111,6 @@ func runWithRestartMonitor(arg0 string, args ...string) {
 		// since backoffSettings.MaxElapsedTime is set to 0 we will never receive backoff.Stop.
 		time.Sleep(backOffTime)
 	}
-
 }
 
 // startTimeSyncService starts the `chronyd` deamon to keep the UVM time synchronized.  We
@@ -131,7 +135,7 @@ func startTimeSyncService() error {
 	expectedClockName := "hyperv\n"
 	for _, ptpDirPath = range ptpDirList {
 		clockNameFilePath := filepath.Join(ptpClassDir.Name(), ptpDirPath, "clock_name")
-		buf, err := ioutil.ReadFile(clockNameFilePath)
+		buf, err := os.ReadFile(clockNameFilePath)
 		if err != nil && !os.IsNotExist(err) {
 			return errors.Wrapf(err, "failed to read clock name file at %s", clockNameFilePath)
 		}
@@ -151,7 +155,7 @@ func startTimeSyncService() error {
 	// chronyd config file take from: https://docs.microsoft.com/en-us/azure/virtual-machines/linux/time-sync
 	chronydConfigString := fmt.Sprintf("refclock PHC %s poll 3 dpoll -2 offset 0 stratum 2\nmakestep 0.1 -1\n", ptpDevPath)
 	chronydConfPath := "/tmp/chronyd.conf"
-	err = ioutil.WriteFile(chronydConfPath, []byte(chronydConfigString), 0644)
+	err = os.WriteFile(chronydConfPath, []byte(chronydConfigString), 0644)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create chronyd conf file %s", chronydConfPath)
 	}
@@ -165,16 +169,36 @@ func startTimeSyncService() error {
 
 func main() {
 	startTime := time.Now()
-	logLevel := flag.String("loglevel", "debug", "Logging Level: debug, info, warning, error, fatal, panic.")
-	coreDumpLoc := flag.String("core-dump-location", "", "The location/format where process core dumps will be written to.")
-	kmsgLogLevel := flag.Uint("kmsgLogLevel", uint(kmsg.Warning), "Log all kmsg entries with a priority less than or equal to the supplied level.")
-	logFile := flag.String("logfile", "", "Logging Target: An optional file name/path. Omit for console output.")
+	logLevel := flag.String("loglevel",
+		"debug",
+		"Logging Level: debug, info, warning, error, fatal, panic.")
+	coreDumpLoc := flag.String("core-dump-location",
+		"",
+		"The location/format where process core dumps will be written to.")
+	kmsgLogLevel := flag.Uint("kmsgLogLevel",
+		uint(kmsg.Warning),
+		"Log all kmsg entries with a priority less than or equal to the supplied level.")
+	logFile := flag.String("logfile",
+		"",
+		"Logging Target: An optional file name/path. Omit for console output.")
 	logFormat := flag.String("log-format", "text", "Logging Format: text or json")
-	useInOutErr := flag.Bool("use-inouterr", false, "If true use stdin/stdout for bridge communication and stderr for logging")
+	useInOutErr := flag.Bool("use-inouterr",
+		false,
+		"If true use stdin/stdout for bridge communication and stderr for logging")
 	v4 := flag.Bool("v4", false, "enable the v4 protocol support and v2 schema")
-	rootMemReserveBytes := flag.Uint64("root-mem-reserve-bytes", 75*1024*1024, "the amount of memory reserved for the orchestration, the rest will be assigned to containers")
-	gcsMemLimitBytes := flag.Uint64("gcs-mem-limit-bytes", 50*1024*1024, "the maximum amount of memory the gcs can use")
-	disableTimeSync := flag.Bool("disable-time-sync", false, "If true do not run chronyd time synchronization service inside the UVM")
+	rootMemReserveBytes := flag.Uint64("root-mem-reserve-bytes",
+		75*1024*1024, // 75Mib
+		"the amount of memory reserved for the orchestration, the rest will be assigned to containers")
+	gcsMemLimitBytes := flag.Uint64("gcs-mem-limit-bytes",
+		50*1024*1024, // 50 MiB
+		"the maximum amount of memory the gcs can use")
+	disableTimeSync := flag.Bool("disable-time-sync",
+		false,
+		"If true do not run chronyd time synchronization service inside the UVM")
+	scrubLogs := flag.Bool("scrub-logs", false, "If true, scrub potentially sensitive information from logging")
+	initialPolicyStance := flag.String("initial-policy-stance",
+		"allow",
+		"Stance: allow, deny.")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "\nUsage of %s:\n", os.Args[0])
@@ -192,7 +216,9 @@ func main() {
 		trace.RegisterExporter(&oc.LogrusExporter{})
 	}
 
-	// Use a file instead of stdout
+	logrus.AddHook(log.NewHook())
+
+	var logWriter *os.File
 	if *logFile != "" {
 		logFileHandle, err := os.OpenFile(*logFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 		if err != nil {
@@ -201,7 +227,25 @@ func main() {
 				logrus.ErrorKey: err,
 			}).Fatal("failed to create log file")
 		}
-		logrus.SetOutput(logFileHandle)
+		logWriter = logFileHandle
+	} else {
+		// logrus uses os.Stderr. see logrus.New()
+		logWriter = os.Stderr
+	}
+
+	// set up our initial stance policy enforcer
+	var initialEnforcer securitypolicy.SecurityPolicyEnforcer
+	switch *initialPolicyStance {
+	case "allow":
+		initialEnforcer = &securitypolicy.OpenDoorSecurityPolicyEnforcer{}
+		logrus.SetOutput(logWriter)
+	case "deny":
+		initialEnforcer = &securitypolicy.ClosedDoorSecurityPolicyEnforcer{}
+		logrus.SetOutput(io.Discard)
+	default:
+		logrus.WithFields(logrus.Fields{
+			"initial-policy-stance": *initialPolicyStance,
+		}).Fatal("unknown initial-policy-stance")
 	}
 
 	switch *logFormat {
@@ -224,15 +268,21 @@ func main() {
 
 	logrus.SetLevel(level)
 
-	baseLogPath := "/run/gcs/c"
+	log.SetScrubbing(*scrubLogs)
 
-	logrus.Info("GCS started")
+	baseLogPath := guestpath.LCOWRootPrefixInUVM
+
+	logrus.WithFields(logrus.Fields{
+		"branch":  version.Branch,
+		"commit":  version.Commit,
+		"version": version.Version,
+	}).Info("GCS started")
 
 	// Set the process core dump location. This will be global to all containers as it's a kernel configuration.
 	// If no path is specified core dumps will just be placed in the working directory of wherever the process
 	// was invoked to a file named "core".
 	if *coreDumpLoc != "" {
-		if err := ioutil.WriteFile(
+		if err := os.WriteFile(
 			"/proc/sys/kernel/core_pattern",
 			[]byte(*coreDumpLoc),
 			0644,
@@ -254,7 +304,7 @@ func main() {
 		Handler:  mux,
 		EnableV4: *v4,
 	}
-	h := hcsv2.NewHost(rtime, tport)
+	h := hcsv2.NewHost(rtime, tport, initialEnforcer, logWriter)
 	b.AssignHandlers(mux, h)
 
 	var bridgeIn io.ReadCloser
@@ -283,7 +333,7 @@ func main() {
 	// Write 1 to memory.use_hierarchy on the root cgroup to enable hierarchy
 	// support. This needs to be set before we create any cgroups as the write
 	// will fail otherwise.
-	if err := ioutil.WriteFile("/sys/fs/cgroup/memory/memory.use_hierarchy", []byte("1"), 0644); err != nil {
+	if err := os.WriteFile("/sys/fs/cgroup/memory/memory.use_hierarchy", []byte("1"), 0644); err != nil {
 		logrus.WithError(err).Fatal("failed to enable hierarchy support for root cgroup")
 	}
 
@@ -297,7 +347,7 @@ func main() {
 		logrus.WithError(err).Fatal("failed to get sys info")
 	}
 	containersLimit := int64(sinfo.Totalram - *rootMemReserveBytes)
-	containersControl, err := cgroups.New(cgroups.V1, cgroups.StaticPath("/containers"), &oci.LinuxResources{
+	containersControl, err := cgroups.New(cgroups.StaticPath("/containers"), &oci.LinuxResources{
 		Memory: &oci.LinuxMemory{
 			Limit: &containersLimit,
 		},
@@ -305,13 +355,13 @@ func main() {
 	if err != nil {
 		logrus.WithError(err).Fatal("failed to create containers cgroup")
 	}
-	defer containersControl.Delete()
+	defer containersControl.Delete() //nolint:errcheck
 
-	gcsControl, err := cgroups.New(cgroups.V1, cgroups.StaticPath("/gcs"), &oci.LinuxResources{})
+	gcsControl, err := cgroups.New(cgroups.StaticPath("/gcs"), &oci.LinuxResources{})
 	if err != nil {
 		logrus.WithError(err).Fatal("failed to create gcs cgroup")
 	}
-	defer gcsControl.Delete()
+	defer gcsControl.Delete() //nolint:errcheck
 	if err := gcsControl.Add(cgroups.Process{Pid: os.Getpid()}); err != nil {
 		logrus.WithError(err).Fatal("failed add gcs pid to gcs cgroup")
 	}
@@ -346,5 +396,4 @@ func main() {
 			logrus.ErrorKey: err,
 		}).Fatal("failed to serve gcs service")
 	}
-
 }
